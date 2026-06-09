@@ -1,0 +1,27 @@
+[project]
+name = "agent-rag"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "meoconlonton",email = "trankimquang1603@gmail.com"}
+]
+readme = "README.md"
+requires-python = "^3.11, <4.0"
+dependencies = [
+    "huggingface-hub (>=1.18.0,<2.0.0)",
+    "langchain (==0.3.24)",
+    "langchain-core (==0.3.56)",
+    "langchain-community (==0.3.23)",
+    "langgraph (==0.3.33)",
+    "pandas (>=3.0.3,<4.0.0)",
+    "pyarrow (>=24.0.0,<25.0.0)",
+    "langchain-experimental (==0.3.4)",
+    "langchain-openai (==0.3.1)",
+    "neo4j (>=6.2.0,<7.0.0)",
+    "pyyaml (>=6.0.3,<7.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

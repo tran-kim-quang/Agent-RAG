@@ -1,0 +1,12 @@
+chunking:
+  chunk_size: 1000
+  chunk_overlap: 200
+
+retriever:
+  top_k: 5
+  graph_max_hops: 2 # Number of hops for graph retrieval
+  rrf_k: 60 # Smoothing parameter for Reciprocal Rank Fusion (RRF)
+
+generation:
+  max_tokens: 2048
+  temperature: 0.0
