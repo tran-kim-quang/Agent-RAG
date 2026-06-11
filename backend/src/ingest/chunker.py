@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from langchain_openai import OpenAIEmbeddings
+from langchain_community.embeddings import OllamaEmbeddings
 from langchain_experimental.text_splitter import SemanticChunker
 
 load_dotenv()
@@ -10,10 +10,10 @@ _embeddings = None
 def _get_embeddings():
     global _embeddings
     if _embeddings is None:
-        _embeddings = OpenAIEmbeddings(
-            model=os.getenv("LLM_MODEL_CHUNKER"),
-            openai_api_key=os.getenv("OLLAMA_API_KEY"),
-            openai_api_base=os.getenv("OLLAMA_BASE_URL"),
+        base_url = os.getenv("OLLAMA_LOCAL_URL", "http://localhost:11434/v1").replace("/v1", "")
+        _embeddings = OllamaEmbeddings(
+            model=os.getenv("EMBEDDING_MODEL_NAME"),
+            base_url=base_url,
         )
     return _embeddings
 

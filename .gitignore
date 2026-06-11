@@ -6,4 +6,4 @@ venv/
 
 .claude
 
-poetry.lock/
+poetry.lock

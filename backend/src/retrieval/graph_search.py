@@ -3,7 +3,7 @@ import yaml
 from pathlib import Path
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
-from langchain_openai import OpenAIEmbeddings
+from langchain_community.embeddings import OllamaEmbeddings
 
 load_dotenv()
 
@@ -17,11 +17,11 @@ GRAPH_MAX_HOPS: int = _CFG["graph_max_hops"]
 RRF_K: int = _CFG["rrf_k"]
 
 
-def _get_embeddings() -> OpenAIEmbeddings:
-    return OpenAIEmbeddings(
+def _get_embeddings() -> OllamaEmbeddings:
+    base_url = os.getenv("OLLAMA_LOCAL_URL", "http://localhost:11434/v1").replace("/v1", "")
+    return OllamaEmbeddings(
         model=os.getenv("EMBEDDING_MODEL_NAME"),
-        openai_api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
-        openai_api_base=os.getenv("OLLAMA_LOCAL_URL", "http://localhost:11434/v1"),
+        base_url=base_url,
     )
 
 
@@ -74,12 +74,13 @@ def graph_search(query: str) -> list[dict]:
         seed_ids = [s["id"] for s in seeds]
 
         # Step 2: expand via NEXT_CHUNK relationships up to max_hops
+        # max_hops must be a literal in the path pattern — parameters are not allowed there
         neighbour_result = session.run(
-            """
+            f"""
             UNWIND $seed_ids AS seedId
             MATCH (seed)
             WHERE elementId(seed) = seedId
-            MATCH path = (seed)-[:NEXT_CHUNK*1..$max_hops]-(neighbour:Chunk)
+            MATCH path = (seed)-[:NEXT_CHUNK*1..{max_hops}]-(neighbour:Chunk)
             RETURN DISTINCT
                 elementId(neighbour) AS id,
                 neighbour.text        AS text,
@@ -87,7 +88,6 @@ def graph_search(query: str) -> list[dict]:
                 neighbour.chunk_index AS chunk_index
             """,
             seed_ids=seed_ids,
-            max_hops=max_hops,
         )
         neighbours = [dict(r) for r in neighbour_result]
 

@@ -1,6 +1,7 @@
+import os
 from pathlib import Path
 
-_DATA_DIR = Path("/home/meocon/work/Agent-RAG/data")
+_DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parents[3] / "data" / "processed")))
 
 def load_documents(config, sample_size=None):
     documents = []
