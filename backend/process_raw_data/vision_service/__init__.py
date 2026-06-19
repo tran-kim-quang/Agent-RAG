@@ -1,3 +1,13 @@
-from .vision_service import describe_image_bytes, describe_image_file
+from .vision_service import (
+    classify_document_page,
+    describe_image_bytes,
+    describe_image_file,
+    describe_page_visuals,
+)
 
-__all__ = ["describe_image_bytes", "describe_image_file"]
+__all__ = [
+    "classify_document_page",
+    "describe_image_bytes",
+    "describe_image_file",
+    "describe_page_visuals",
+]
