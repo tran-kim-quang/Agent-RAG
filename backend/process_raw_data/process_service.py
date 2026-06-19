@@ -1,4 +1,5 @@
 import re
+import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -6,9 +7,13 @@ from pathlib import Path
 from typing import Iterable
 from xml.etree import ElementTree
 
+from backend.process_raw_data.correct_service import correct_vietnamese_ocr_text
+from backend.process_raw_data.ocr_service import extract_text_from_image
 from backend.process_raw_data.vision_service import (
+    classify_document_page,
     describe_image_bytes,
     describe_image_file,
+    describe_page_visuals,
 )
 
 _MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
@@ -111,7 +116,7 @@ def _extract_pdf_image_sections(pdf_path: Path) -> tuple[str, list[str]]:
             page_texts.append(text.strip())
 
         for image_index, image in enumerate(getattr(page, "images", []), start=1):
-            image_name = getattr(image, "name", None) or f"page-{page_number}-image-{image_index}.png"
+            image_name = getattr(image, "name", None) or f"pa   ge-{page_number}-image-{image_index}.png"
             try:
                 description = describe_image_bytes(
                     image.data,
@@ -122,6 +127,123 @@ def _extract_pdf_image_sections(pdf_path: Path) -> tuple[str, list[str]]:
             image_sections.append(_build_image_section(image_name, description))
 
     return "\n\n".join(page_texts), image_sections
+
+
+def _extract_pdf_page_text(pdf_path: Path, page_number: int, reader=None) -> str:
+    if reader is not None:
+        page = reader.pages[page_number - 1]
+        if hasattr(page, "extract_text"):
+            return (page.extract_text() or "").strip()
+
+    result = subprocess.run(
+        ["pdftotext", "-f", str(page_number), "-l", str(page_number), str(pdf_path), "-"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _render_pdf_page_to_image(pdf_path: Path, page_number: int) -> tuple[str, bytes]:
+    with tempfile.TemporaryDirectory(prefix="agent_rag_pdf_page_") as temp_dir:
+        output_base = Path(temp_dir) / f"page-{page_number}"
+        subprocess.run(
+            [
+                "pdftoppm",
+                "-f",
+                str(page_number),
+                "-l",
+                str(page_number),
+                "-png",
+                "-singlefile",
+                str(pdf_path),
+                str(output_base),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        image_path = output_base.with_suffix(".png")
+        return image_path.name, image_path.read_bytes()
+
+
+def _classify_page_image_with_vlm(image_bytes: bytes, image_name: str | None = None) -> dict[str, str]:
+    return classify_document_page(image_bytes, image_name=image_name)
+
+
+def _ocr_page_image(image_bytes: bytes, image_name: str | None = None) -> str:
+    return extract_text_from_image(image_bytes, image_name=image_name)
+
+
+def _correct_vietnamese_ocr_text(text: str) -> str:
+    return correct_vietnamese_ocr_text(text)
+
+
+def _describe_page_visuals_with_vlm(image_bytes: bytes, image_name: str | None = None) -> str:
+    return describe_page_visuals(image_bytes, image_name=image_name)
+
+
+def _build_page_ocr_section(page_number: int, text: str) -> str:
+    return f"[Page OCR: {page_number}]\n{text.strip()}"
+
+
+def _build_page_visual_section(page_number: int, description: str) -> str:
+    return f"[Page visual understanding: {page_number}]\n{description.strip()}"
+
+
+def _extract_pdf_embedded_image_sections(page, page_number: int) -> list[str]:
+    sections = []
+    for image_index, image in enumerate(getattr(page, "images", []), start=1):
+        image_name = getattr(image, "name", None) or f"page-{page_number}-image-{image_index}.png"
+        try:
+            description = describe_image_bytes(image.data, image_name=image_name)
+        except Exception:
+            continue
+        sections.append(_build_image_section(image_name, description))
+    return sections
+
+
+def _get_pdf_page_count(pdf_path: Path, reader=None) -> int:
+    if reader is not None:
+        return len(reader.pages)
+
+    result = subprocess.run(
+        ["pdfinfo", str(pdf_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("Pages:"):
+            return int(line.split(":", 1)[1].strip())
+    raise ValueError(f"Could not determine page count for {pdf_path}")
+
+
+def _process_pdf_page(pdf_path: Path, page_number: int, reader=None) -> list[str]:
+    page_text = _extract_pdf_page_text(pdf_path, page_number, reader=reader)
+    if page_text:
+        sections = [page_text]
+        if reader is not None:
+            sections.extend(_extract_pdf_embedded_image_sections(reader.pages[page_number - 1], page_number))
+        return sections
+
+    image_name, image_bytes = _render_pdf_page_to_image(pdf_path, page_number)
+    classification = _classify_page_image_with_vlm(image_bytes, image_name=image_name)
+    label = classification.get("label", "text_only")
+
+    sections = []
+    if label in {"text_only", "text_with_complex_visuals"}:
+        ocr_text = _ocr_page_image(image_bytes, image_name=image_name)
+        if ocr_text.strip():
+            corrected_text = _correct_vietnamese_ocr_text(ocr_text)
+            sections.append(_build_page_ocr_section(page_number, corrected_text))
+
+    if label in {"text_with_complex_visuals", "visual_only_or_diagram"}:
+        visual_description = _describe_page_visuals_with_vlm(image_bytes, image_name=image_name)
+        if visual_description.strip():
+            sections.append(_build_page_visual_section(page_number, visual_description))
+
+    return sections
 
 
 def _extract_pdf_with_poppler(pdf_path: Path) -> tuple[str, list[str]]:
@@ -156,9 +278,15 @@ def _extract_pdf_with_poppler(pdf_path: Path) -> tuple[str, list[str]]:
 
 
 def _process_pdf(pdf_path: Path) -> dict:
-    text_content, image_sections = _extract_pdf_image_sections(pdf_path)
+    PdfReader = _get_pdf_reader_class()
+    reader = PdfReader(str(pdf_path)) if PdfReader is not None else None
+    page_count = _get_pdf_page_count(pdf_path, reader=reader)
+    sections = []
+    for page_number in range(1, page_count + 1):
+        sections.extend(_process_pdf_page(pdf_path, page_number, reader=reader))
+
     return {
-        "content": _append_image_understanding(text_content, image_sections),
+        "content": "\n\n".join(section for section in sections if section.strip()),
         "metadata": {
             "source": str(pdf_path),
             "name": pdf_path.stem,
