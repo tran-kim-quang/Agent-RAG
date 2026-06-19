@@ -86,6 +86,126 @@ def test_process_pdf_appends_image_understanding(monkeypatch, tmp_path):
     assert doc["metadata"]["source_type"] == "pdf"
 
 
+def test_process_pdf_uses_text_layer_directly(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "text-layer.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class FakeReader:
+        def __init__(self, path):
+            self.pages = [SimpleNamespace()]
+
+    monkeypatch.setattr(process_service, "_get_pdf_reader_class", lambda: FakeReader)
+    monkeypatch.setattr(
+        process_service,
+        "_extract_pdf_page_text",
+        lambda pdf_path_arg, page_number, reader=None: "Native PDF text",
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_render_pdf_page_to_image",
+        lambda pdf_path_arg, page_number: (_ for _ in ()).throw(AssertionError("should not render")),
+    )
+
+    doc = process_service.process_file(pdf_path)
+
+    assert "Native PDF text" in doc["content"]
+    assert "[Page OCR:" not in doc["content"]
+    assert "[Page visual understanding:" not in doc["content"]
+
+
+def test_process_pdf_uses_ocr_and_correction_for_text_only_page(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "scan.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class FakeReader:
+        def __init__(self, path):
+            self.pages = [SimpleNamespace()]
+
+    monkeypatch.setattr(process_service, "_get_pdf_reader_class", lambda: FakeReader)
+    monkeypatch.setattr(
+        process_service,
+        "_extract_pdf_page_text",
+        lambda pdf_path_arg, page_number, reader=None: "",
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_render_pdf_page_to_image",
+        lambda pdf_path_arg, page_number: ("page-1.png", b"page-image"),
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_classify_page_image_with_vlm",
+        lambda image_bytes, image_name=None: {"label": "text_only", "reason": "mostly text"},
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_ocr_page_image",
+        lambda image_bytes, image_name=None: "van ban ocr",
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_correct_vietnamese_ocr_text",
+        lambda text: "văn bản OCR đã sửa",
+    )
+
+    doc = process_service.process_file(pdf_path)
+
+    assert "[Page OCR: 1]" in doc["content"]
+    assert "văn bản OCR đã sửa" in doc["content"]
+    assert "[Page visual understanding:" not in doc["content"]
+
+
+def test_process_pdf_uses_ocr_and_visual_understanding_for_complex_page(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "complex.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class FakeReader:
+        def __init__(self, path):
+            self.pages = [SimpleNamespace()]
+
+    monkeypatch.setattr(process_service, "_get_pdf_reader_class", lambda: FakeReader)
+    monkeypatch.setattr(
+        process_service,
+        "_extract_pdf_page_text",
+        lambda pdf_path_arg, page_number, reader=None: "",
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_render_pdf_page_to_image",
+        lambda pdf_path_arg, page_number: ("page-1.png", b"page-image"),
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_classify_page_image_with_vlm",
+        lambda image_bytes, image_name=None: {
+            "label": "text_with_complex_visuals",
+            "reason": "diagram and labels",
+        },
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_ocr_page_image",
+        lambda image_bytes, image_name=None: "noi dung OCR",
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_correct_vietnamese_ocr_text",
+        lambda text: "nội dung OCR đã sửa",
+    )
+    monkeypatch.setattr(
+        process_service,
+        "_describe_page_visuals_with_vlm",
+        lambda image_bytes, image_name=None: "Mô tả sơ đồ và các mũi tên.",
+    )
+
+    doc = process_service.process_file(pdf_path)
+
+    assert "[Page OCR: 1]" in doc["content"]
+    assert "nội dung OCR đã sửa" in doc["content"]
+    assert "[Page visual understanding: 1]" in doc["content"]
+    assert "Mô tả sơ đồ và các mũi tên." in doc["content"]
+
+
 def test_load_documents_includes_supported_multimodal_files(tmp_path, monkeypatch):
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
