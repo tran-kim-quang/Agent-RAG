@@ -55,5 +55,4 @@ AutoModelForSeq2SeqLM.from_pretrained(
 print(f"Preloaded correction model: {model_id}")
 PY
 
-ENTRYPOINT ["python", "-m", "backend.main"]
-CMD ["interactive"]
+ENTRYPOINT ["python", "-m", "backend.process_raw_data"]

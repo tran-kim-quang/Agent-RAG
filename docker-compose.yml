@@ -1,8 +1,11 @@
 x-ollama-base: &ollama-base
   image: ollama/ollama
-  container_name: ollama
   volumes:
     - ollama_data:/root/.ollama
+  networks:
+    default:
+      aliases:
+        - ollama
   healthcheck:
     test: ["CMD", "ollama", "list"]
     interval: 10s
@@ -22,16 +25,34 @@ services:
     <<: *ollama-base
     profiles: [cpu]
 
-  ollama-gpu:
+  ollama-nvidia:
     <<: *ollama-base
-    profiles: [gpu]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    profiles: [nvidia]
+    gpus: all
+
+  ollama-amd:
+    <<: *ollama-base
+    profiles: [amd]
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "44"
+      - "992"
+    environment:
+      OLLAMA_VULKAN: "1"
+      GGML_VK_VISIBLE_DEVICES: "1,2"
+
+  ollama-intel:
+    <<: *ollama-base
+    profiles: [intel]
+    devices:
+      - /dev/dri
+    group_add:
+      - "44"
+      - "992"
+    environment:
+      OLLAMA_VULKAN: "1"
 
   neo4j:
     image: neo4j:5.20
@@ -51,11 +72,24 @@ services:
       retries: 5
 
   backend:
-    build: .
+    build:
+      context: .
+      args:
+        HF_TOKENS: ${HF_TOKENS:-}
+        APP_BUILD_REV: ${APP_BUILD_REV:-local}
     env_file: .env
+    entrypoint: ["uvicorn", "backend.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "44"
+      - "992"
     environment:
       NEO4J_URI: bolt://neo4j:7687
       OLLAMA_LOCAL_URL: http://ollama:11434/v1
+    ports:
+      - "8000:8000"
     volumes:
       - ./data:/app/data
     depends_on:
@@ -63,6 +97,30 @@ services:
         condition: service_healthy
     stdin_open: true
     tty: true
+
+  process-raw-data:
+    build:
+      context: .
+      dockerfile: backend/process_raw_data/Dockerfile
+      args:
+        HF_TOKENS: ${HF_TOKENS:-}
+        APP_BUILD_REV: ${APP_BUILD_REV:-local}
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    env_file: .env
+    environment:
+      RAW_DATA_DIR: /app/data/raw
+      PROCESSED_DATA_DIR: /app/data/processed
+    volumes:
+      - ./data:/app/data
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
 
 volumes:
   neo4j_data:
