@@ -2,6 +2,8 @@ const chatForm = document.getElementById("chat-form");
 const chatInput = document.getElementById("chat-input");
 const chatLog = document.getElementById("chat-log");
 const chatStatus = document.getElementById("chat-status");
+const chatSteps = document.getElementById("chat-steps");
+const chatRunId = document.getElementById("chat-run-id");
 
 const uploadForm = document.getElementById("upload-form");
 const fileInput = document.getElementById("file-input");
@@ -13,17 +15,27 @@ const graphSummary = document.getElementById("graph-summary");
 const graphCanvas = document.getElementById("graph-canvas");
 let uploadPollTimer = null;
 let graphPollTimer = null;
+let chatPollTimer = null;
 let selectedGraphSource = null;
+let activeChatRunId = null;
+const completedChatRuns = new Set();
 
 function setStatus(element, state, label) {
   element.className = `status-pill ${state}`;
   element.textContent = label;
 }
 
+function normalizeText(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return String(value);
+}
+
 function appendMessage(role, content) {
   const node = document.createElement("article");
   node.className = `message ${role}`;
-  node.innerHTML = `<p>${content.replace(/\n/g, "<br/>")}</p>`;
+  node.innerHTML = `<p>${escapeHtml(normalizeText(content)).replace(/\n/g, "<br/>")}</p>`;
   chatLog.appendChild(node);
   chatLog.scrollTop = chatLog.scrollHeight;
 }
@@ -53,11 +65,88 @@ function stopGraphPolling() {
   }
 }
 
+function stopChatPolling() {
+  if (chatPollTimer) {
+    clearInterval(chatPollTimer);
+    chatPollTimer = null;
+  }
+}
+
 function escapeHtml(value) {
-  return value
+  return normalizeText(value)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+function formatPhaseLabel(phase) {
+  return String(phase || "unknown")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function renderChatSteps(events, status) {
+  if (!events?.length) {
+    chatSteps.innerHTML = `
+      <div class="step-item idle">
+        <strong>Idle</strong>
+        <span>Agent monitoring will appear here after you send a question.</span>
+      </div>
+    `;
+    return;
+  }
+
+  chatSteps.innerHTML = events
+    .map((event, index) => {
+      const state =
+        status === "failed" && index === events.length - 1
+          ? "error"
+          : index === events.length - 1 && status !== "completed"
+            ? "loading"
+            : "success";
+
+      return `
+        <div class="step-item ${state}">
+          <strong>${escapeHtml(formatPhaseLabel(event.phase))}</strong>
+          <span>${escapeHtml(event.message || "")}</span>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+async function pollChatStatus(runId) {
+  const response = await fetch(`/api/chat/${runId}`);
+  const payload = await readApiResponse(response);
+
+  if (!response.ok) {
+    throw new Error(payload.detail || "Could not load chat status.");
+  }
+
+  chatRunId.textContent = `Run ${runId.slice(0, 8)}`;
+  renderChatSteps(payload.events || [], payload.status);
+  setStatus(
+    chatStatus,
+    payload.status === "failed" ? "error" : payload.status === "completed" ? "success" : "loading",
+    payload.status === "processing" ? "Thinking" : payload.status,
+  );
+
+  if (payload.status === "completed") {
+    if (!completedChatRuns.has(runId)) {
+      appendMessage("assistant", payload.answer || "");
+      completedChatRuns.add(runId);
+    }
+    stopChatPolling();
+    return;
+  }
+
+  if (payload.status === "failed") {
+    if (!completedChatRuns.has(runId)) {
+      appendMessage("assistant", `Error: ${payload.error || payload.message || "Chat request failed."}`);
+      completedChatRuns.add(runId);
+    }
+    stopChatPolling();
+  }
 }
 
 function renderGraphDocuments(documents) {
@@ -183,9 +272,13 @@ chatForm.addEventListener("submit", async (event) => {
   const message = chatInput.value.trim();
   if (!message) return;
 
+  stopChatPolling();
+  activeChatRunId = null;
   appendMessage("user", message);
   chatInput.value = "";
   setStatus(chatStatus, "loading", "Waiting");
+  chatRunId.textContent = "Starting run...";
+  renderChatSteps([], "idle");
 
   try {
     const response = await fetch("/api/chat", {
@@ -199,8 +292,18 @@ chatForm.addEventListener("submit", async (event) => {
       throw new Error(payload.detail || "Chat request failed.");
     }
 
-    appendMessage("assistant", payload.answer);
-    setStatus(chatStatus, "success", "Answered");
+    chatRunId.textContent = `Run ${payload.run_id.slice(0, 8)}`;
+    activeChatRunId = payload.run_id;
+    renderChatSteps(payload.events || [], payload.status);
+    setStatus(chatStatus, "loading", "Thinking");
+    chatPollTimer = setInterval(() => {
+      pollChatStatus(payload.run_id).catch((error) => {
+        appendMessage("assistant", `Error: ${error.message}`);
+        setStatus(chatStatus, "error", "Error");
+        stopChatPolling();
+      });
+    }, 1200);
+    await pollChatStatus(payload.run_id);
   } catch (error) {
     appendMessage("assistant", `Error: ${error.message}`);
     setStatus(chatStatus, "error", "Error");

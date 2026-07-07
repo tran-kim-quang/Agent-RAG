@@ -1,6 +1,8 @@
 import re
 import unicodedata
 
+from backend.src.core.models import DocumentRecord
+
 
 def normalize_text(text: str) -> str:
     # Unicode NFC normalization (important for Vietnamese diacritics)
@@ -38,11 +40,16 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+class DefaultDocumentCleaner:
+    def clean(self, document: DocumentRecord) -> DocumentRecord:
+        return DocumentRecord(
+            content=normalize_text(document.content),
+            metadata=dict(document.metadata),
+        )
+
+
 def clean_document(doc: dict) -> dict:
-    return {
-        "content": normalize_text(doc["content"]),
-        "metadata": doc["metadata"],
-    }
+    return DefaultDocumentCleaner().clean(DocumentRecord.from_dict(doc)).to_dict()
 
 
 def clean_documents(documents: list[dict]) -> list[dict]:

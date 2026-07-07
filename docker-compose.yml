@@ -79,12 +79,6 @@ services:
         APP_BUILD_REV: ${APP_BUILD_REV:-local}
     env_file: .env
     entrypoint: ["uvicorn", "backend.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
-    devices:
-      - /dev/kfd
-      - /dev/dri
-    group_add:
-      - "44"
-      - "992"
     environment:
       NEO4J_URI: bolt://neo4j:7687
       OLLAMA_LOCAL_URL: http://ollama:11434/v1
@@ -105,7 +99,6 @@ services:
       args:
         HF_TOKENS: ${HF_TOKENS:-}
         APP_BUILD_REV: ${APP_BUILD_REV:-local}
-    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     env_file: .env
     environment:
       RAW_DATA_DIR: /app/data/raw
