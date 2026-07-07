@@ -5,8 +5,20 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, description="User message sent from the frontend")
 
 
+class AgentRunEventResponse(BaseModel):
+    timestamp: str
+    phase: str
+    message: str
+    details: dict = Field(default_factory=dict)
+
+
 class ChatResponse(BaseModel):
-    answer: str
+    run_id: str
+    status: str
+    message: str
+    answer: str | None = None
+    error: str | None = None
+    events: list[AgentRunEventResponse] = Field(default_factory=list)
 
 
 class UploadResponse(BaseModel):

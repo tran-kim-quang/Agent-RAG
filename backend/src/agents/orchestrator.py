@@ -6,8 +6,10 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
 
+from backend.src.monitoring import agent_run_monitor
 from backend.src.agents.processData_agent import process_data_agent_tool
 from backend.src.agents.retrieval_agent import retrieval_agent_tool
+from backend.src.tools.processData_tool import _decode_uploaded_content, process_and_ingest_uploaded_file
 
 load_dotenv()
 
@@ -42,34 +44,29 @@ def run(query: str) -> str:
         The orchestrator's final answer.
     """
     logger.info("[orchestrator/query] Received query: %s", query)
+    agent_run_monitor.append_event(
+        "orchestrator_start",
+        "Orchestrator is deciding which agent tools to call.",
+        {"query_length": len(query)},
+        status="processing",
+    )
     result = orchestrator.invoke({"messages": [HumanMessage(content=query)]})
+    final_answer = result["messages"][-1].content
+    agent_run_monitor.append_event(
+        "orchestrator_complete",
+        "Orchestrator finished the workflow and returned a final answer.",
+        {"answer_length": len(final_answer)},
+        status="processing",
+    )
     logger.info("[orchestrator/query] Query handled successfully")
-    return result["messages"][-1].content
+    return final_answer
 
 
 def ingest_uploaded_document(file_name: str, file_content_base64: str) -> dict:
-    """Route uploaded document ingestion through the orchestrator toolchain."""
+    """Handle uploaded document ingestion with a structured result."""
     logger.info("[orchestrator/ingest] Routing uploaded document: file_name=%s", file_name)
-    result = process_data_agent_tool.invoke(
-        {
-            "file_name": file_name,
-            "file_content_base64": file_content_base64,
-        }
-    )
-
-    lines = [line.strip() for line in result.splitlines() if line.strip()]
-    payload = {
-        "message": lines[0] if lines else "Processed document successfully.",
-    }
-
-    for line in lines[1:]:
-        if ":" not in line:
-            continue
-        key, value = line.lstrip("- ").split(":", 1)
-        payload[key.strip()] = value.strip()
-
-    if "chunks_ingested" in payload:
-        payload["chunk_count"] = int(payload.pop("chunks_ingested"))
-
+    file_bytes = _decode_uploaded_content(file_content_base64)
+    payload = process_and_ingest_uploaded_file(file_name, file_bytes)
+    payload["message"] = f"Processed '{payload['source_name']}' successfully."
     logger.info("[orchestrator/ingest] Uploaded document handled: payload=%s", payload)
     return payload

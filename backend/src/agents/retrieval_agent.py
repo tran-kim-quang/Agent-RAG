@@ -4,6 +4,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langchain.tools import tool
 from langgraph.prebuilt import create_react_agent
+
+from backend.src.monitoring import agent_run_monitor
 from backend.src.tools.retrieval_tool import graph_search_tool
 
 load_dotenv()
@@ -41,5 +43,18 @@ def retrieval_agent_tool(query: str) -> str:
     Returns:
         Relevant document excerpts with source information.
     """
+    agent_run_monitor.append_event(
+        "retrieval_agent_start",
+        "Retrieval agent is analyzing the user question.",
+        {"query_length": len(query)},
+        status="processing",
+    )
     result = retrieval_agent.invoke({"messages": [HumanMessage(content=query)]})
-    return result["messages"][-1].content
+    answer = result["messages"][-1].content
+    agent_run_monitor.append_event(
+        "retrieval_agent_complete",
+        "Retrieval agent completed context gathering.",
+        {"answer_length": len(answer)},
+        status="processing",
+    )
+    return answer

@@ -248,6 +248,73 @@ button:hover {
   gap: 16px;
 }
 
+.agent-monitor {
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: #f8f5ee;
+  padding: 16px;
+}
+
+.monitor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.monitor-run-id {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.step-log {
+  display: grid;
+  gap: 10px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.step-item {
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--paper);
+  padding: 12px 14px;
+  display: grid;
+  gap: 4px;
+}
+
+.step-item strong {
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.step-item span {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.step-item.loading strong {
+  color: #8b5e00;
+}
+
+.step-item.success strong {
+  color: var(--accent);
+}
+
+.step-item.error strong {
+  color: #9e281d;
+}
+
+.step-item.idle strong {
+  color: #726757;
+}
+
 .chat-log {
   min-height: 320px;
   max-height: 520px;

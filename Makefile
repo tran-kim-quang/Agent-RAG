@@ -2,6 +2,7 @@ LOCAL_UID := $(shell id -u)
 LOCAL_GID := $(shell id -g)
 DOCKER_ENV := LOCAL_UID=$(LOCAL_UID) LOCAL_GID=$(LOCAL_GID)
 COMPOSE := $(DOCKER_ENV) docker compose
+PYTHON_VERSION ?= 3.13
 GPU_PROFILE ?= $(shell \
 	if command -v lspci >/dev/null 2>&1 && lspci | grep -Eqi 'NVIDIA'; then \
 		printf '%s' nvidia; \
@@ -10,12 +11,22 @@ GPU_PROFILE ?= $(shell \
 	elif command -v lspci >/dev/null 2>&1 && lspci | grep -Eqi 'Intel|Arc'; then \
 		printf '%s' intel; \
 	else \
-		printf '%s' cpu; \
+		printf '%s' nvidia; \
 	fi)
 OLLAMA_SERVICE := ollama-$(GPU_PROFILE)
 
 .DEFAULT_GOAL := backend
-.PHONY: backend detect-gpu
+.PHONY: backend detect-gpu install test frontend-dev
+
+install:
+	poetry env use $(PYTHON_VERSION)
+	poetry install
+
+test:
+	poetry run python -m pytest -q
+
+frontend-dev:
+	poetry run python frontend/dev_server.py --host 127.0.0.1 --port 3000 --backend http://127.0.0.1:8000
 
 detect-gpu:
 	@printf 'Detected backend profile: %s\n' "$(GPU_PROFILE)"

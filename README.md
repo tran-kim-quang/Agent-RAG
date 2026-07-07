@@ -89,7 +89,7 @@ cd Agent-RAG
 Repo dùng `.env` để cấu hình model, Neo4j, Ollama, và token. Các biến quan trọng gồm:
 
 ```bash
-COMPOSE_PROFILES=cpu
+COMPOSE_PROFILES=nvidia
 OLLAMA_API_KEY=your_ollama_api_key
 LLM_MODEL_NAME=your_chat_model
 VISION_MODEL_NAME=your_vision_model
@@ -104,21 +104,34 @@ NEO4J_PASSWORD=password
 
 Ghi chú:
 
-- Nếu bạn chạy với Docker Compose trong cùng network, backend sẽ dùng `bolt://neo4j:7687` bên trong container.
-- `make` sẽ tự dò profile GPU để chọn `cpu`, `nvidia`, `amd`, hoặc `intel` cho Ollama.
+- Nếu chạy với Docker Compose trong cùng network, backend sẽ dùng `bolt://neo4j:7687` bên trong container.
+- `make` sẽ tự dò profile GPU để chọn `nvidia`, `amd`, hoặc `intel` cho Ollama; nếu không dò được thì mặc định vẫn chọn `nvidia`.
+- Trên Windows + Docker Desktop, chỉ `ollama-nvidia` dùng GPU trực tiếp. `backend` không cần mount `/dev/kfd` hay `/dev/dri`.
 
 ### 3. Khởi động hệ thống
 
 #### Cách khuyến nghị
 
 ```bash
-make
+make # Cho Linux/Ubuntu
 ```
 
 Lệnh này sẽ:
 
 - Dò GPU hiện có.
 - Khởi chạy `neo4j`, service Ollama phù hợp với profile, và `backend`.
+
+#### Chạy trên Windows + Docker Desktop + NVIDIA
+
+```bash
+docker compose --profile nvidia up -d --build
+```
+
+Ghi chú:
+
+- Docker Desktop chạy Linux containers qua WSL2, nhưng GPU vẫn được cấp từ máy Windows host.
+- Với cấu hình hiện tại, GPU được dùng ở service `ollama-nvidia`.
+- `backend` chỉ gọi Ollama qua HTTP nên không cần mount device Linux GPU.
 
 #### Nếu muốn chạy đầy đủ cả frontend
 
@@ -157,6 +170,21 @@ docker compose --profile cpu up -d neo4j ollama-cpu backend
 docker compose up -d frontend
 ```
 
+### Frontend local không qua Docker
+
+Khi backend đang chạy ở `http://127.0.0.1:8000`, bạn có thể chạy frontend local để sửa UI mà không cần rebuild image:
+
+```bash
+make frontend-dev
+```
+
+Lệnh này sẽ:
+
+- serve thư mục `frontend/` ở `http://127.0.0.1:3000`
+- proxy mọi request `/api/*` sang backend `http://127.0.0.1:8000`
+
+Nhờ vậy bạn chỉ cần sửa file trong `frontend/` rồi refresh trình duyệt.
+
 ### Kiểm tra trạng thái
 
 ```bash
@@ -185,6 +213,21 @@ Body:
   "message": "LLMOps la gi?"
 }
 ```
+
+Endpoint này trả về `run_id` ngay để frontend hoặc client có thể theo dõi agent đang làm gì theo từng bước.
+
+### Xem trạng thái agent run
+
+```bash
+GET /api/chat/{run_id}
+```
+
+Response sẽ gồm:
+
+- `status`: `queued`, `processing`, `completed`, hoặc `failed`
+- `message`: trạng thái mới nhất của agent
+- `answer`: câu trả lời cuối nếu đã xong
+- `events`: danh sách các bước như orchestrator start, retrieval, vector search, graph expansion, rerank
 
 ### Upload tài liệu
 
