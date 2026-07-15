@@ -1,115 +1,115 @@
 from __future__ import annotations
 
-import logging
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from threading import Lock
+from pathlib import Path
+import re
 from typing import Callable
 from uuid import uuid4
 
-from backend.src.tools.processData_tool import process_and_ingest_uploaded_file
-
-logger = logging.getLogger(__name__)
-
-ProcessUploadedFileFn = Callable[[str, bytes, Callable[[str, str, dict | None], None] | None], dict]
+from backend.src.core.repositories import ObjectStorage, UploadRepository
+from backend.src.db import UploadJob
 
 
 class UploadJobService:
     def __init__(
         self,
-        process_uploaded_file: ProcessUploadedFileFn = process_and_ingest_uploaded_file,
-        max_workers: int = 2,
+        uploads: UploadRepository,
+        storage: ObjectStorage,
+        enqueue: Callable[[str, str, str, str], str] | None = None,
     ) -> None:
-        self._process_uploaded_file = process_uploaded_file
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ingest-worker")
-        self._job_lock = Lock()
-        self._jobs: dict[str, dict] = {}
+        self._uploads = uploads
+        self._storage = storage
+        self._enqueue = enqueue or self._enqueue_task
 
-    def create_upload_job(self, file_name: str, file_bytes: bytes) -> dict:
-        job = self._create_job(file_name)
-        with self._job_lock:
-            self._jobs[job["job_id"]] = job
-        self._executor.submit(self._run_ingest_job, job["job_id"], file_name, file_bytes)
-        return dict(job)
-
-    def get_upload_job(self, job_id: str) -> dict | None:
-        with self._job_lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return None
-            return dict(job)
-
-    @staticmethod
-    def _now_iso() -> str:
-        return datetime.now(timezone.utc).isoformat()
-
-    def _create_job(self, file_name: str) -> dict:
-        timestamp = self._now_iso()
-        return {
-            "job_id": uuid4().hex,
-            "file_name": file_name,
-            "status": "queued",
-            "phase": "queued",
-            "message": f"Queued '{file_name}' for background ingest.",
-            "raw_path": None,
-            "processed_path": None,
-            "metadata_path": None,
-            "chunk_count": None,
-            "indexed_chunks": 0,
-            "total_chunks": None,
-            "source_name": None,
-            "error": None,
-            "created_at": timestamp,
-            "updated_at": timestamp,
-        }
-
-    def _update_job(self, job_id: str, **updates) -> None:
-        with self._job_lock:
-            job = self._jobs[job_id]
-            job.update(updates)
-            job["updated_at"] = self._now_iso()
-
-    def _run_ingest_job(self, job_id: str, file_name: str, file_bytes: bytes) -> None:
-        logger.info("[upload/service] Starting background ingest job: job_id=%s file_name=%s", job_id, file_name)
-        self._update_job(job_id, status="processing", phase="start", message=f"Started ingest for '{file_name}'.")
-
-        def progress_callback(phase: str, message: str, details: dict | None = None) -> None:
-            logger.info("[upload/service] Progress update: job_id=%s phase=%s message=%s", job_id, phase, message)
-            updates = {
-                "status": "processing",
-                "phase": phase,
-                "message": message,
-            }
-            if details:
-                updates.update(details)
-            self._update_job(job_id, **updates)
-
+    def create_upload_job(
+        self,
+        file_name: str,
+        file_bytes: bytes,
+        user_id: str,
+        content_type: str | None = None,
+    ) -> dict:
+        job_id = uuid4().hex
+        safe_name = Path(file_name.replace("\\", "/")).name.strip()
+        if not safe_name:
+            raise ValueError("Uploaded file name is empty.")
+        object_name = re.sub(r"[^A-Za-z0-9._-]", "_", safe_name)
+        message = f"Queued '{safe_name}' for background ingest."
+        object_key = f"users/{user_id}/uploads/{job_id}/raw/{object_name}"
+        self._uploads.create(
+            job_id,
+            user_id,
+            safe_name,
+            message,
+            content_type=content_type,
+            size_bytes=len(file_bytes),
+        )
         try:
-            result = self._process_uploaded_file(
-                file_name=file_name,
-                file_bytes=file_bytes,
-                progress_callback=progress_callback,
-            )
-            self._update_job(
-                job_id,
-                status="completed",
-                phase="done",
-                message=f"Processed '{result['source_name']}' successfully.",
-                raw_path=result["raw_path"],
-                processed_path=result["processed_path"],
-                metadata_path=result["metadata_path"],
-                chunk_count=result["chunk_count"],
-                indexed_chunks=result["chunk_count"],
-                total_chunks=result["chunk_count"],
-                source_name=result["source_name"],
-            )
-            logger.info("[upload/service] Background ingest completed: job_id=%s result=%s", job_id, result)
+            self._storage.put_bytes(object_key, file_bytes, content_type or "application/octet-stream")
+            self._uploads.update(job_id, raw_object_key=object_key, phase="stored", progress=1)
+            task_id = self._enqueue(job_id, user_id, safe_name, object_key)
+            self._uploads.update(job_id, task_id=task_id)
         except Exception as exc:
-            logger.exception("[upload/service] Background ingest failed: job_id=%s file_name=%s", job_id, file_name)
-            self._update_job(
+            self._uploads.update(
                 job_id,
                 status="failed",
                 phase="failed",
-                message=f"Document ingest failed for '{file_name}'.",
+                message=f"Could not queue '{safe_name}'.",
                 error=str(exc),
+                finished_at=datetime.now(timezone.utc),
             )
+            raise
+        item = self._uploads.get(job_id)
+        if item is None:
+            raise RuntimeError("Upload job was not persisted.")
+        return self._job_to_dict(item)
+
+    def get_upload_job(self, job_id: str, user_id: str | None = None, is_admin: bool = False) -> dict | None:
+        item = self._uploads.get(job_id)
+        if item is None or (user_id is not None and not is_admin and item.user_id != user_id):
+            return None
+        return self._job_to_dict(item)
+
+    def list_upload_jobs(self, limit: int = 20, user_id: str | None = None) -> list[dict]:
+        return [self._job_to_dict(job) for job in self._uploads.list(user_id=user_id, limit=limit)]
+
+    def get_download(self, job_id: str, user_id: str, is_admin: bool = False) -> tuple[bytes, str, str] | None:
+        item = self._uploads.get(job_id)
+        if item is None or (not is_admin and item.user_id != user_id) or not item.raw_object_key:
+            return None
+        return (
+            self._storage.get_bytes(item.raw_object_key),
+            item.file_name,
+            item.content_type or "application/octet-stream",
+        )
+
+    @staticmethod
+    def _enqueue_task(job_id: str, user_id: str, file_name: str, object_key: str) -> str:
+        from backend.src.tasks.jobs import run_upload_task
+
+        return run_upload_task.apply_async(args=[job_id, user_id, file_name, object_key]).id
+
+    @staticmethod
+    def _job_to_dict(job: UploadJob) -> dict:
+        return {
+            "job_id": job.id,
+            "user_id": job.user_id,
+            "file_name": job.file_name,
+            "status": job.status,
+            "phase": job.phase,
+            "message": job.message,
+            "raw_path": job.raw_path,
+            "processed_path": job.processed_path,
+            "metadata_path": job.metadata_path,
+            "raw_object_key": job.raw_object_key,
+            "processed_object_key": job.processed_object_key,
+            "metadata_object_key": job.metadata_object_key,
+            "chunk_count": job.chunk_count,
+            "indexed_chunks": job.indexed_chunks,
+            "total_chunks": job.total_chunks,
+            "source_name": job.source_name,
+            "progress": job.progress,
+            "attempt_count": job.attempt_count,
+            "error": job.error,
+            "created_at": job.created_at.isoformat(),
+            "updated_at": job.updated_at.isoformat(),
+        }

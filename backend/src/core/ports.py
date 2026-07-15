@@ -40,7 +40,7 @@ class GraphIndexer(Protocol):
 
 
 class GraphSearcher(Protocol):
-    def search(self, query: str) -> list[dict]:
+    def search(self, query: str, owner_id: str | None = None) -> list[dict]:
         ...
 
 

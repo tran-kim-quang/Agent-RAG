@@ -1,270 +1,191 @@
 # Agent-RAG
 
-Agent-RAG là một hệ thống hỏi đáp tài liệu theo mô hình RAG, kết hợp ingest đa phương thức, embedding, Neo4j graph, và giao diện web để chat và nạp tài liệu vào kho tri thức.
+Agent-RAG la he thong hoi dap tai lieu theo mo hinh RAG, ket hop ingest da phuong thuc, Neo4j graph, worker xu ly nen va giao dien Next.js.
 
-## Tổng quan
-
-Mục tiêu của dự án là:
-
-- Nạp tài liệu từ file `.pdf`, `.docx`, `.md`, ảnh và một số tài liệu có hình minh họa.
-- Trích xuất nội dung văn bản, OCR, mô tả ảnh, rồi chuẩn hóa thành markdown.
-- Chia nhỏ nội dung thành các chunk, tạo embedding, và lưu vào Neo4j.
-- Truy hồi nội dung bằng vector search + mở rộng theo quan hệ `NEXT_CHUNK`.
-- Cung cấp giao diện web để upload tài liệu, theo dõi trạng thái ingest, và chat với dữ liệu đã index.
-
-## Kiến Trúc
-
-Hệ thống gồm 5 khối chính:
-
-1. Frontend
-   - Giao diện tĩnh chạy qua Nginx trong thư mục `frontend/`.
-   - Hỗ trợ upload tài liệu, xem trạng thái ingest, và gửi câu hỏi chat.
-
-2. Backend API
-   - FastAPI trong `backend/api/`.
-   - Cung cấp các endpoint cho health check, chat, upload tài liệu, xem trạng thái job, và xem graph document.
-
-3. Ingest pipeline
-   - Code xử lý file nằm trong `backend/process_raw_data/` và `backend/src/tools/processData_tool.py`.
-   - File được lưu vào `data/raw`, xử lý sang markdown trong `data/processed`, rồi index vào Neo4j.
-
-4. Graph index và retrieval
-   - Lưu các node `Document`, `Chunk` và quan hệ `HAS_CHUNK`, `NEXT_CHUNK` trong Neo4j.
-   - Tìm kiếm theo embedding và rerank trong `backend/src/retrieval/` và `backend/src/index/`.
-
-5. Model services
-   - Ollama được dùng cho embedding và một số tác vụ LLM/VLM tùy cấu hình.
-   - Neo4j lưu graph và vector index.
-
-### Luồng dữ liệu
+## Kien Truc
 
 ```mermaid
 flowchart LR
-    A[Frontend upload/chat] --> B[FastAPI backend]
-    B --> C[Process raw document]
-    C --> D[Write markdown + metadata]
-    D --> E[Clean + chunk]
-    E --> F[Generate embeddings]
-    F --> G[Neo4j: Document / Chunk / relationships]
-    G --> H[Retrieval via vector search + NEXT_CHUNK]
-    H --> I[LLM answer]
-    I --> A
+    UI[Next.js frontend] --> API[FastAPI]
+    API --> PG[(PostgreSQL)]
+    API --> MINIO[(MinIO)]
+    API --> REDIS[Redis broker]
+    REDIS --> WORKER[Celery worker]
+    WORKER --> MINIO
+    WORKER --> PIPELINE[OCR / clean / chunk / embed]
+    PIPELINE --> NEO[(Neo4j)]
+    WORKER --> PG
+    API --> NEO
 ```
 
-## Cấu trúc thư mục
+- PostgreSQL la nguon du lieu chinh cho user, refresh token, chat session/message, upload job va document metadata.
+- Redis chi dieu phoi Celery task va result ngan han; khong luu lich su nghiep vu.
+- MinIO self-host luu file goc, markdown va metadata da xu ly.
+- Neo4j chi luu knowledge graph, chunk va embedding.
+- FastAPI xac thuc JWT, kiem tra ownership va khong xu ly chat/ingest trong process API.
+- Celery worker xu ly chat va ingest, co retry, attempt count, worker ID va heartbeat; Celery Beat danh dau task mat heartbeat.
+
+## Bao Mat
+
+- Access JWT co thoi gian song ngan va duoc frontend giu trong memory.
+- Refresh JWT nam trong cookie `HttpOnly`, duoc rotate va revoke qua PostgreSQL.
+- Tat ca chat, upload va graph endpoint deu loc theo `user_id`; admin duoc truy cap API quan tri.
+- `Document` va `Chunk` trong Neo4j co `owner_id`; retrieval worker lay owner tu task context.
+- Frontend khong ket noi truc tiep Neo4j hoac MinIO.
+- Neo4j, PostgreSQL va Redis khong publish port ra host trong Docker Compose.
+- MinIO console chi bind `127.0.0.1`; file download di qua backend de kiem tra ownership.
+- CORS dung allowlist tu `CORS_ORIGINS`; `/api/status` chi danh cho admin va khong tra database URI.
+
+## Cau Truc
 
 ```text
-backend/
-  api/                # FastAPI app và schema
-  process_raw_data/   # OCR, vision, xử lý PDF/DOCX/MD/ảnh
-  src/
-    agents/           # orchestrator và agent tools
-    index/            # tạo graph, list document, get graph detail
-    ingest/           # loader, cleaner, chunker
-    retrieval/        # graph search
-    tools/            # tool ingest và retrieval
-frontend/             # giao diện web tĩnh + Nginx
-data/raw/             # file gốc upload vào
-data/processed/       # markdown và metadata đã xử lý
-tests/                # test ingest và vision
+backend/api/          # FastAPI routes, schemas, auth dependencies
+backend/src/db/       # SQLAlchemy models va persistent store
+backend/src/security/ # JWT, Argon2 password hashing, user context
+backend/src/storage/  # MinIO adapter
+backend/src/tasks/    # Celery app va chat/ingest tasks
+backend/src/index/    # Neo4j indexing va graph queries
+backend/src/retrieval/# vector search va graph expansion
+backend/src/ingest/   # clean/chunk pipeline
+migrations/           # Alembic migrations
+frontend/             # Next.js application
+tests/                # backend tests
 ```
 
-## Yêu Cầu Hệ Thống
+## Chuan Bi Moi Truong
 
-- Docker và Docker Compose v2.
-- Linux hoặc môi trường có hỗ trợ Docker.
-- Nếu chạy local không qua Docker, cần Python 3.11+ và các dịch vụ Neo4j, Ollama, model endpoint tương ứng.
+Yeu cau Docker Compose v2, NVIDIA driver va NVIDIA Container Toolkit. Neu chay local khong qua Docker, can Python 3.11+ va Node.js.
 
-## Cài Đặt Nhanh Bằng Docker
-
-### 1. Clone repository
+Tao `.env` tu `.env.example`, sau do thay moi gia tri `replace_with_*`. Co the tao secret bang:
 
 ```bash
-git clone <repo-url>
-cd Agent-RAG
+openssl rand -base64 48
 ```
 
-### 2. Chuẩn bị file `.env`
-
-Repo dùng `.env` để cấu hình model, Neo4j, Ollama, và token. Các biến quan trọng gồm:
+Nhung bien bat buoc khi chay Docker:
 
 ```bash
-COMPOSE_PROFILES=nvidia
-OLLAMA_API_KEY=your_ollama_api_key
-LLM_MODEL_NAME=your_chat_model
-VISION_MODEL_NAME=your_vision_model
-LLM_MODEL_CHUNKER=your_chunker_model
-EMBEDDING_MODEL_NAME=nomic-embed-text
-OLLAMA_BASE_URL=https://ollama.com/v1
-OLLAMA_LOCAL_URL=http://localhost:11434/v1
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=password
+POSTGRES_PASSWORD=<strong-random-secret>
+REDIS_PASSWORD=<strong-random-secret>
+MINIO_ROOT_PASSWORD=<strong-random-secret>
+NEO4J_PASSWORD=<strong-random-secret>
+JWT_SECRET=<at-least-32-random-bytes>
 ```
 
-Ghi chú:
-
-- Nếu chạy với Docker Compose trong cùng network, backend sẽ dùng `bolt://neo4j:7687` bên trong container.
-- `make` sẽ tự dò profile GPU để chọn `nvidia`, `amd`, hoặc `intel` cho Ollama; nếu không dò được thì mặc định vẫn chọn `nvidia`.
-- Trên Windows + Docker Desktop, chỉ `ollama-nvidia` dùng GPU trực tiếp. `backend` không cần mount `/dev/kfd` hay `/dev/dri`.
-
-### 3. Khởi động hệ thống
-
-#### Cách khuyến nghị
+Production nen cau hinh them:
 
 ```bash
-make # Cho Linux/Ubuntu
+ENVIRONMENT=production
+COOKIE_SECURE=true
+ALLOW_FIRST_USER_ADMIN=false
+BOOTSTRAP_ADMIN_EMAIL=admin@example.com
+BOOTSTRAP_ADMIN_PASSWORD=<strong-admin-password>
+CORS_ORIGINS=https://your-frontend.example.com
 ```
 
-Lệnh này sẽ:
+Neu volume Neo4j da duoc khoi tao bang password cu, doi password trong database truoc. Sua `NEO4J_AUTH` khong tu dong doi credential cua volume hien co.
 
-- Dò GPU hiện có.
-- Khởi chạy `neo4j`, service Ollama phù hợp với profile, và `backend`.
+## Khoi Dong
 
-#### Chạy trên Windows + Docker Desktop + NVIDIA
+Linux voi Make:
 
 ```bash
-docker compose --profile nvidia up -d --build
+make
 ```
 
-Ghi chú:
-
-- Docker Desktop chạy Linux containers qua WSL2, nhưng GPU vẫn được cấp từ máy Windows host.
-- Với cấu hình hiện tại, GPU được dùng ở service `ollama-nvidia`.
-- `backend` chỉ gọi Ollama qua HTTP nên không cần mount device Linux GPU.
-
-#### Nếu muốn chạy đầy đủ cả frontend
+Hoac chay toan bo stack bang Docker Compose:
 
 ```bash
-docker compose --profile cpu up -d --build
+docker compose up -d --build
 ```
 
-Nếu máy bạn có GPU khác, thay `cpu` bằng profile tương ứng:
-
-- `nvidia`
-- `amd`
-- `intel`
-
-### 4. Mở ứng dụng
+Compose chi target NVIDIA: Ollama va Celery ingest worker deu duoc cap `gpus: all`. Cac dia chi local:
 
 - Frontend: http://localhost:3000
-- Backend API: http://localhost:8000
-- Neo4j Browser: http://localhost:7474
+- Backend API/OpenAPI: http://localhost:8000/docs
+- MinIO Console: http://127.0.0.1:9001
 
-Thông tin đăng nhập Neo4j mặc định trong compose:
+Neo4j Browser va Bolt khong duoc publish khoi Docker network. Frontend doc graph qua FastAPI.
 
-- username: `neo4j`
-- password: `password`
-
-## Chạy Từng Thành Phần
-
-### Backend riêng
+Theo doi worker va API:
 
 ```bash
-docker compose --profile cpu up -d neo4j ollama-cpu backend
+docker compose logs -f backend worker beat
 ```
 
-### Frontend riêng
-
-```bash
-docker compose up -d frontend
-```
-
-### Frontend local không qua Docker
-
-Khi backend đang chạy ở `http://127.0.0.1:8000`, bạn có thể chạy frontend local để sửa UI mà không cần rebuild image:
+Chay frontend development:
 
 ```bash
 make frontend-dev
 ```
 
-Lệnh này sẽ:
+Frontend dung `NEXT_PUBLIC_API_BASE_URL`, mac dinh `http://localhost:8000/api`.
 
-- serve thư mục `frontend/` ở `http://127.0.0.1:3000`
-- proxy mọi request `/api/*` sang backend `http://127.0.0.1:8000`
+## Database Migration
 
-Nhờ vậy bạn chỉ cần sửa file trong `frontend/` rồi refresh trình duyệt.
-
-### Kiểm tra trạng thái
+Backend container chay migration truoc khi khoi dong Uvicorn. Chay thu cong:
 
 ```bash
-docker ps
-docker logs -f agent-rag-backend-1
+poetry run alembic upgrade head
 ```
 
-## API Chính
-
-### Health check
+Tao migration moi sau khi sua SQLAlchemy models:
 
 ```bash
-GET /api/health
+poetry run alembic revision --autogenerate -m "describe change"
 ```
 
-### Chat
+## API
 
-```bash
+Public endpoints:
+
+```text
+GET  /api/health
+POST /api/auth/register
+POST /api/auth/login
+POST /api/auth/refresh
+POST /api/auth/logout
+```
+
+User endpoints yeu cau `Authorization: Bearer <access-token>`:
+
+```text
+GET  /api/users/me
 POST /api/chat
-```
-
-Body:
-
-```json
-{
-  "message": "LLMOps la gi?"
-}
-```
-
-Endpoint này trả về `run_id` ngay để frontend hoặc client có thể theo dõi agent đang làm gì theo từng bước.
-
-### Xem trạng thái agent run
-
-```bash
-GET /api/chat/{run_id}
-```
-
-Response sẽ gồm:
-
-- `status`: `queued`, `processing`, `completed`, hoặc `failed`
-- `message`: trạng thái mới nhất của agent
-- `answer`: câu trả lời cuối nếu đã xong
-- `events`: danh sách các bước như orchestrator start, retrieval, vector search, graph expansion, rerank
-
-### Upload tài liệu
-
-```bash
+GET  /api/chat/{run_id}
+GET  /api/chat/sessions
+GET  /api/chat/sessions/{run_id}
 POST /api/documents/upload
+GET  /api/documents/uploads
+GET  /api/documents/upload/{job_id}
+GET  /api/documents/upload/{job_id}/download
+GET  /api/graph/documents
+GET  /api/graph/document?source=<source>
 ```
 
-Endpoint này trả về job ID và trạng thái ingest. File sẽ được xử lý ở background, vì vậy UI có thể theo dõi tiến trình mà không bị treo trong lúc chờ.
+Admin endpoints:
 
-### Xem trạng thái upload
+```text
+GET /api/admin/users
+GET /api/admin/uploads
+GET /api/admin/chat-sessions
+GET /api/admin/users/{user_id}/uploads
+GET /api/admin/users/{user_id}/chat-sessions
+GET /api/status
+```
+
+Upload flow:
+
+1. API validate extension, size va ownership.
+2. API luu file goc vao MinIO.
+3. API ghi upload job vao PostgreSQL va enqueue Celery task qua Redis.
+4. Worker tai object, xu ly va index Neo4j theo `owner_id`.
+5. Worker day markdown/metadata vao MinIO va cap nhat progress trong PostgreSQL.
+
+## Kiem Thu
 
 ```bash
-GET /api/documents/upload/{job_id}
+poetry run python -m pytest -q
+cd frontend
+npm run build
 ```
-
-### Xem danh sách tài liệu đã index
-
-```bash
-GET /api/graph/documents
-```
-
-### Xem graph của một tài liệu
-
-```bash
-GET /api/graph/document?source=<source_path>
-```
-
-## Neo4j Data Model
-
-Hệ thống lưu dữ liệu theo mô hình sau:
-
-- `Document`
-  - Thuộc tính thường dùng: `source`, `name`, `raw_source`, `original_file_name`, `source_type`, `chunk_count`, `indexed_chunks`, `updated_at`
-- `Chunk`
-  - Thuộc tính thường dùng: `id`, `text`, `source`, `chunk_index`, `embedding`, `updated_at`
-- Quan hệ
-  - `(:Document)-[:HAS_CHUNK]->(:Chunk)`
-  - `(:Chunk)-[:NEXT_CHUNK]->(:Chunk)`
-
-Neo4j cũng tạo vector index `document_chunks` để phục vụ truy hồi semantic search.

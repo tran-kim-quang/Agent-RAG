@@ -1,38 +1,9 @@
-import os
-from pathlib import Path
 from typing import Callable
 
-import yaml
-from dotenv import load_dotenv
 from langchain_community.embeddings import OllamaEmbeddings
-from neo4j import GraphDatabase
 
 from backend.src.core.models import ChunkRecord
-
-load_dotenv()
-
-_CONFIG_PATH = Path(__file__).parents[2] / "configs" / "config.yaml"
-
-
-def _load_config() -> dict:
-    with open(_CONFIG_PATH, encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
-
-
-def _get_embeddings() -> OllamaEmbeddings:
-    base_url = os.getenv("OLLAMA_LOCAL_URL", "http://localhost:11434/v1").replace("/v1", "")
-    return OllamaEmbeddings(
-        model=os.getenv("EMBEDDING_MODEL_NAME"),
-        base_url=base_url,
-    )
-
-
-def _neo4j_conn() -> dict:
-    return {
-        "url": os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-        "username": os.getenv("NEO4J_USERNAME", "neo4j"),
-        "password": os.getenv("NEO4J_PASSWORD", "password"),
-    }
+from backend.src.infrastructure import create_neo4j_driver, get_ollama_embeddings
 
 
 ProgressCallback = Callable[[str, str, dict | None], None]
@@ -51,11 +22,13 @@ def _emit_progress(
 class Neo4jGraphIndexer:
     def __init__(
         self,
-        embeddings_factory: Callable[[], OllamaEmbeddings] = _get_embeddings,
+        embeddings_factory: Callable[[], OllamaEmbeddings] = get_ollama_embeddings,
         driver_factory: Callable[[], object] | None = None,
+        owner_id: str = "system",
     ) -> None:
         self._embeddings_factory = embeddings_factory
         self._driver_factory = driver_factory or self._default_driver_factory
+        self._owner_id = owner_id
 
     def build_index(
         self,
@@ -102,6 +75,7 @@ class Neo4jGraphIndexer:
                     """
                     MERGE (d:Document {source: $source})
                     SET d.name                    = $document_name,
+                        d.owner_id                = $owner_id,
                         d.raw_source              = $raw_source,
                         d.processed_metadata_path = $processed_metadata_path,
                         d.original_file_name      = $original_file_name,
@@ -111,6 +85,7 @@ class Neo4jGraphIndexer:
                     MERGE (c:Chunk {id: $id})
                     SET c.text        = $text,
                         c.source      = $source,
+                        c.owner_id    = $owner_id,
                         c.chunk_index = $chunk_index,
                         c.updated_at  = datetime()
                     MERGE (d)-[:HAS_CHUNK]->(c)
@@ -120,6 +95,7 @@ class Neo4jGraphIndexer:
                     id=chunk_id,
                     text=chunk.content,
                     source=chunk.metadata.get("source", ""),
+                    owner_id=self._owner_id,
                     chunk_index=chunk.metadata.get("chunk_index", 0),
                     document_name=chunk.metadata.get("name", ""),
                     raw_source=chunk.metadata.get("raw_source", ""),
@@ -145,21 +121,24 @@ class Neo4jGraphIndexer:
 
             session.run(
                 """
-                MATCH (a:Chunk {source: $source}), (b:Chunk {source: $source})
+                MATCH (a:Chunk {source: $source, owner_id: $owner_id}),
+                      (b:Chunk {source: $source, owner_id: $owner_id})
                 WHERE b.chunk_index = a.chunk_index + 1
                 MERGE (a)-[:NEXT_CHUNK]->(b)
                 """,
                 source=source,
+                owner_id=self._owner_id,
             )
 
             session.run(
                 """
-                MATCH (d:Document {source: $source})-[:HAS_CHUNK]->(c:Chunk)
+                MATCH (d:Document {source: $source, owner_id: $owner_id})-[:HAS_CHUNK]->(c:Chunk)
                 WITH d, count(c) AS indexed_chunks
                 SET d.indexed_chunks = indexed_chunks,
                     d.updated_at = datetime()
                 """,
                 source=source,
+                owner_id=self._owner_id,
             )
 
         _emit_progress(
@@ -172,20 +151,20 @@ class Neo4jGraphIndexer:
 
     @staticmethod
     def _default_driver_factory():
-        conn = _neo4j_conn()
-        return GraphDatabase.driver(conn["url"], auth=(conn["username"], conn["password"]))
+        return create_neo4j_driver()
 
 
 class Neo4jGraphRepository:
     def __init__(self, driver_factory: Callable[[], object] | None = None) -> None:
         self._driver_factory = driver_factory or Neo4jGraphIndexer._default_driver_factory
 
-    def list_documents(self, limit: int = 20) -> list[dict]:
+    def list_documents(self, limit: int = 20, owner_id: str | None = None) -> list[dict]:
         driver = self._driver_factory()
         with driver.session() as session:
             result = session.run(
                 """
                 MATCH (c:Chunk)
+                WHERE $owner_id IS NULL OR c.owner_id = $owner_id
                 WITH c.source AS source, count(c) AS actual_chunk_nodes, max(c.updated_at) AS chunk_updated_at
                 OPTIONAL MATCH (d:Document {source: source})
                 RETURN
@@ -201,18 +180,21 @@ class Neo4jGraphRepository:
                 LIMIT $limit
                 """,
                 limit=limit,
+                owner_id=owner_id,
             )
             documents = [dict(record) for record in result]
         driver.close()
         return documents
 
-    def get_document_graph(self, source: str, limit_chunks: int = 18) -> dict:
+    def get_document_graph(self, source: str, limit_chunks: int = 18, owner_id: str | None = None) -> dict:
         driver = self._driver_factory()
         with driver.session() as session:
             doc_result = session.run(
                 """
                 OPTIONAL MATCH (d:Document {source: $source})
+                WHERE $owner_id IS NULL OR d.owner_id = $owner_id
                 OPTIONAL MATCH (c:Chunk {source: $source})
+                WHERE $owner_id IS NULL OR c.owner_id = $owner_id
                 WITH d, count(c) AS actual_chunk_nodes, max(c.updated_at) AS chunk_updated_at
                 RETURN
                     $source AS source,
@@ -226,6 +208,7 @@ class Neo4jGraphRepository:
                     actual_chunk_nodes AS actual_chunk_nodes
                 """,
                 source=source,
+                owner_id=owner_id,
             ).single()
 
             if doc_result is None or doc_result["actual_chunk_nodes"] == 0:
@@ -239,6 +222,7 @@ class Neo4jGraphRepository:
             chunk_result = session.run(
                 """
                 MATCH (c:Chunk {source: $source})
+                WHERE $owner_id IS NULL OR c.owner_id = $owner_id
                 RETURN
                     c.id AS id,
                     c.chunk_index AS chunk_index,
@@ -248,12 +232,14 @@ class Neo4jGraphRepository:
                 """,
                 source=source,
                 limit_chunks=limit_chunks,
+                owner_id=owner_id,
             )
             nodes = [dict(record) for record in chunk_result]
 
             edge_result = session.run(
                 """
                 MATCH (a:Chunk {source: $source})-[:NEXT_CHUNK]->(b:Chunk {source: $source})
+                WHERE $owner_id IS NULL OR (a.owner_id = $owner_id AND b.owner_id = $owner_id)
                 RETURN
                     a.id AS source_id,
                     b.id AS target_id
@@ -262,6 +248,7 @@ class Neo4jGraphRepository:
                 """,
                 source=source,
                 limit_edges=max(limit_chunks - 1, 0),
+                owner_id=owner_id,
             )
             edges = [dict(record) for record in edge_result]
 
@@ -281,9 +268,11 @@ def build_graph_index(
     indexer.build_index([ChunkRecord.from_dict(chunk) for chunk in chunks], progress_callback=progress_callback)
 
 
-def list_graph_documents(limit: int = 20) -> list[dict]:
-    return Neo4jGraphRepository().list_documents(limit=limit)
+def list_graph_documents(limit: int = 20, owner_id: str | None = None) -> list[dict]:
+    return Neo4jGraphRepository().list_documents(limit=limit, owner_id=owner_id)
 
 
-def get_document_graph(source: str, limit_chunks: int = 18) -> dict:
-    return Neo4jGraphRepository().get_document_graph(source=source, limit_chunks=limit_chunks)
+def get_document_graph(source: str, limit_chunks: int = 18, owner_id: str | None = None) -> dict:
+    return Neo4jGraphRepository().get_document_graph(
+        source=source, limit_chunks=limit_chunks, owner_id=owner_id
+    )

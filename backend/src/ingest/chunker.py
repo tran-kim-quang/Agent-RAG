@@ -1,42 +1,40 @@
-import os
-from dotenv import load_dotenv
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_core.documents import Document
 from langchain_experimental.text_splitter import SemanticChunker
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from backend.src.core.models import ChunkRecord, DocumentRecord
-
-load_dotenv()
-
-_embeddings = None
-
-
-def _get_embeddings():
-    global _embeddings
-    if _embeddings is None:
-        base_url = os.getenv("OLLAMA_LOCAL_URL", "http://localhost:11434/v1").replace("/v1", "")
-        _embeddings = OllamaEmbeddings(
-            model=os.getenv("EMBEDDING_MODEL_NAME"),
-            base_url=base_url,
-        )
-    return _embeddings
+from backend.src.infrastructure import get_ollama_embeddings, load_config
 
 
 class SemanticDocumentChunker:
-    def __init__(self, embeddings_factory=_get_embeddings) -> None:
+    def __init__(self, embeddings_factory=get_ollama_embeddings, config_loader=load_config) -> None:
         self._embeddings_factory = embeddings_factory
+        self._config_loader = config_loader
 
     def chunk(self, document: DocumentRecord) -> list[ChunkRecord]:
-        splitter = SemanticChunker(
+        semantic_splitter = SemanticChunker(
             embeddings=self._embeddings_factory(),
             breakpoint_threshold_type="percentile",
         )
-        chunks = splitter.create_documents([document.content])
+        semantic_chunks = semantic_splitter.create_documents(
+            [document.content],
+            metadatas=[document.metadata],
+        )
+        config = self._config_loader()
+        chunking_config = config.get("chunking", {})
+        size_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=int(chunking_config.get("chunk_size", 1000)),
+            chunk_overlap=int(chunking_config.get("chunk_overlap", 200)),
+        )
+        bounded_chunks: list[Document] = size_splitter.split_documents(semantic_chunks)
+
         return [
             ChunkRecord(
                 content=chunk.page_content,
-                metadata={**document.metadata, "chunk_index": i},
+                metadata={**chunk.metadata, **document.metadata, "chunk_index": i},
             )
-            for i, chunk in enumerate(chunks)
+            for i, chunk in enumerate(bounded_chunks)
+            if chunk.page_content.strip()
         ]
 
 

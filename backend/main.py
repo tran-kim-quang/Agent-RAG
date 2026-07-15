@@ -1,17 +1,8 @@
 import argparse
-import yaml
-from pathlib import Path
 from dotenv import load_dotenv
+from backend.src.infrastructure import load_config
 
 load_dotenv()
-
-_CONFIG_PATH = Path(__file__).parent / "configs" / "config.yaml"
-
-
-def _load_config() -> dict:
-    with open(_CONFIG_PATH) as f:
-        return yaml.safe_load(f)
-
 
 def ingest(sample_size: int | None = None) -> None:
     """Run the full ingest pipeline: load → clean → chunk → index."""
@@ -20,7 +11,7 @@ def ingest(sample_size: int | None = None) -> None:
     from backend.src.ingest.chunker import chunk_documents
     from backend.src.index.graph_index import build_graph_index
 
-    config = _load_config()
+    config = load_config()
 
     print("Loading documents...")
     docs = load_documents(config, sample_size=sample_size)

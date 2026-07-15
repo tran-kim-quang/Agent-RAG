@@ -12,3 +12,8 @@ __pycache__/
 poetry.lock
 
 .pytest_cache/
+
+data/*.db
+data/raw/*
+data/processed/*
+celerybeat-schedule*

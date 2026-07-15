@@ -1,104 +1,159 @@
-x-ollama-base: &ollama-base
-  image: ollama/ollama
+x-app-base: &app-base
+  image: agent-rag-app:${APP_IMAGE_TAG:-local}
+  build:
+    context: .
+    args:
+      APP_BUILD_REV: ${APP_BUILD_REV:-local}
+    secrets:
+      - hf_token
+  env_file: .env
+  environment: &app-environment
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-agent_rag}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agent_rag}
+    REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD}@redis:6379/0
+    NEO4J_URI: bolt://neo4j:7687
+    NEO4J_USERNAME: neo4j
+    NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD}
+    MINIO_ENDPOINT: minio:9000
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agent-rag}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+    MINIO_BUCKET: ${MINIO_BUCKET:-agent-rag}
+    MINIO_SECURE: "false"
+    OLLAMA_LOCAL_URL: http://ollama:11434/v1
   volumes:
-    - ollama_data:/root/.ollama
-  networks:
-    default:
-      aliases:
-        - ollama
-  healthcheck:
-    test: ["CMD", "ollama", "list"]
-    interval: 10s
-    timeout: 5s
-    retries: 15
-    start_period: 30s
-  entrypoint: ["/bin/bash", "-c"]
-  command: >
-    "ollama serve &
-    until ollama list > /dev/null 2>&1; do sleep 2; done &&
-    ollama pull nomic-embed-text &&
-    wait"
+    - ./data:/app/data
 
 services:
-
-  ollama-cpu:
-    <<: *ollama-base
-    profiles: [cpu]
-
-  ollama-nvidia:
-    <<: *ollama-base
-    profiles: [nvidia]
+  ollama:
+    image: ollama/ollama
     gpus: all
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "ollama serve &
+      until ollama list > /dev/null 2>&1; do sleep 2; done &&
+      ollama pull ${EMBEDDING_MODEL_NAME:-nomic-embed-text} &&
+      wait"
 
-  ollama-amd:
-    <<: *ollama-base
-    profiles: [amd]
-    devices:
-      - /dev/kfd
-      - /dev/dri
-    group_add:
-      - "44"
-      - "992"
+  postgres:
+    image: postgres:17-alpine
     environment:
-      OLLAMA_VULKAN: "1"
-      GGML_VK_VISIBLE_DEVICES: "1,2"
+      POSTGRES_DB: ${POSTGRES_DB:-agent_rag}
+      POSTGRES_USER: ${POSTGRES_USER:-agent_rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
-  ollama-intel:
-    <<: *ollama-base
-    profiles: [intel]
-    devices:
-      - /dev/dri
-    group_add:
-      - "44"
-      - "992"
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD}"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     environment:
-      OLLAMA_VULKAN: "1"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agent-rag}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   neo4j:
     image: neo4j:5.20
-    ports:
-      - "7474:7474"
-      - "7687:7687"
     environment:
-      NEO4J_AUTH: neo4j/password
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD}
+      HEALTHCHECK_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD}
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_dbms_security_procedures_unrestricted: apoc.*
     volumes:
       - neo4j_data:/data
     healthcheck:
-      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "password", "RETURN 1"]
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$${HEALTHCHECK_PASSWORD}\" 'RETURN 1'"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   backend:
-    build:
-      context: .
-      args:
-        HF_TOKENS: ${HF_TOKENS:-}
-        APP_BUILD_REV: ${APP_BUILD_REV:-local}
-    env_file: .env
-    entrypoint: ["uvicorn", "backend.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    <<: *app-base
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["alembic upgrade head && uvicorn backend.api.app:app --host 0.0.0.0 --port 8000"]
     environment:
-      NEO4J_URI: bolt://neo4j:7687
-      OLLAMA_LOCAL_URL: http://ollama:11434/v1
+      <<: *app-environment
+      AUTO_CREATE_SCHEMA: "false"
     ports:
       - "8000:8000"
-    volumes:
-      - ./data:/app/data
     depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
       neo4j:
         condition: service_healthy
-    stdin_open: true
-    tty: true
+
+  worker:
+    <<: *app-base
+    gpus: all
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["celery -A backend.src.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency=$${WORKER_CONCURRENCY:-2}"]
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+  beat:
+    <<: *app-base
+    entrypoint: ["celery"]
+    command: ["-A", "backend.src.tasks.celery_app:celery_app", "beat", "--loglevel=INFO"]
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
 
   process-raw-data:
     build:
       context: .
       dockerfile: backend/process_raw_data/Dockerfile
       args:
-        HF_TOKENS: ${HF_TOKENS:-}
         APP_BUILD_REV: ${APP_BUILD_REV:-local}
+      secrets:
+        - hf_token
+    profiles: [tools]
+    gpus: all
     env_file: .env
     environment:
       RAW_DATA_DIR: /app/data/raw
@@ -111,10 +166,17 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
     ports:
-      - "3000:80"
+      - "3000:3000"
     depends_on:
       - backend
 
 volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
   neo4j_data:
   ollama_data:
+
+secrets:
+  hf_token:
+    environment: HF_TOKENS

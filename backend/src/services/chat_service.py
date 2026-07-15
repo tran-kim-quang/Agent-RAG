@@ -9,10 +9,10 @@ logger = logging.getLogger(__name__)
 
 
 class ChatService:
-    def __init__(self, query_runner: Callable[[str], str] | None = None) -> None:
+    def __init__(self, query_runner: Callable[[str, str, list[dict[str, str]]], str] | None = None) -> None:
         self._query_runner = query_runner
 
-    def answer(self, message: str) -> str:
+    def answer(self, message: str, chat_session_id: str, history: list[dict[str, str]]) -> str:
         logger.info("[chat/service] Handling chat request")
         agent_run_monitor.append_event(
             "chat_service_start",
@@ -21,7 +21,7 @@ class ChatService:
             status="processing",
         )
         query_runner = self._query_runner or self._default_query_runner
-        answer = query_runner(message)
+        answer = query_runner(message, chat_session_id, history)
         agent_run_monitor.append_event(
             "chat_service_complete",
             "Chat service received the orchestrator answer.",
@@ -32,7 +32,7 @@ class ChatService:
         return answer
 
     @staticmethod
-    def _default_query_runner(message: str) -> str:
+    def _default_query_runner(message: str, chat_session_id: str, history: list[dict[str, str]]) -> str:
         from backend.src.agents.orchestrator import run as run_query
 
-        return run_query(message)
+        return run_query(message, chat_session_id, history)
