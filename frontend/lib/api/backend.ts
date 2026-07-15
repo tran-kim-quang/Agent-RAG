@@ -1,3 +1,5 @@
+import { AuthenticationExpiredError, AuthSessionManager } from "./auth-session";
+
 export type AgentRunEvent = {
   timestamp: string;
   phase: string;
@@ -85,8 +87,6 @@ export type RuntimeLog = { time: string; level: string; message: string };
 export type RuntimeStatus = { status: string; metrics: RuntimeMetric[]; configs: RuntimeConfig[]; logs: RuntimeLog[] };
 
 const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api").replace(/\/$/, "");
-let accessToken: string | null = null;
-let refreshPromise: Promise<AuthResponse> | null = null;
 
 async function readResponse<T>(response: Response): Promise<T> {
   const contentType = response.headers.get("content-type") ?? "";
@@ -97,15 +97,15 @@ async function readResponse<T>(response: Response): Promise<T> {
 
 async function apiFetch(path: string, init: RequestInit = {}, retry = true): Promise<Response> {
   const headers = new Headers(init.headers);
-  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  headers.set("Authorization", `Bearer ${await authSession.accessToken()}`);
   const response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers, credentials: "include" });
   if (response.status === 401 && retry) {
-    try {
-      await refreshSession();
-      return apiFetch(path, init, false);
-    } catch {
-      accessToken = null;
-    }
+    await refreshSession();
+    return apiFetch(path, init, false);
+  }
+  if (response.status === 401) {
+    authSession.clear();
+    throw new AuthenticationExpiredError();
   }
   return response;
 }
@@ -118,8 +118,7 @@ async function submitCredentials(path: string, email: string, password: string):
     body: JSON.stringify({ email, password }),
   });
   const payload = await readResponse<AuthResponse>(response);
-  accessToken = payload.access_token;
-  return payload;
+  return authSession.accept(payload);
 }
 
 export function login(email: string, password: string) {
@@ -130,24 +129,28 @@ export function register(email: string, password: string) {
   return submitCredentials("/auth/register", email, password);
 }
 
-export async function refreshSession(): Promise<AuthResponse> {
-  if (!refreshPromise) {
-    refreshPromise = fetch(`${API_BASE_URL}/auth/refresh`, { method: "POST", credentials: "include" })
-      .then(readResponse<AuthResponse>)
-      .then((payload) => {
-        accessToken = payload.access_token;
-        return payload;
-      })
-      .finally(() => {
-        refreshPromise = null;
-      });
-  }
-  return refreshPromise;
+async function requestRefresh(): Promise<AuthResponse> {
+  const response = await fetch(`${API_BASE_URL}/auth/refresh`, { method: "POST", credentials: "include" });
+  if (response.status === 401) throw new AuthenticationExpiredError();
+  return readResponse<AuthResponse>(response);
+}
+
+const authSession = new AuthSessionManager<AuthResponse>(requestRefresh);
+
+export function refreshSession(): Promise<AuthResponse> {
+  return authSession.refresh();
+}
+
+export function subscribeAuthSession(listener: (session: AuthResponse | null) => void): () => void {
+  return authSession.subscribe(listener);
 }
 
 export async function logout(): Promise<void> {
-  await fetch(`${API_BASE_URL}/auth/logout`, { method: "POST", credentials: "include" });
-  accessToken = null;
+  try {
+    await fetch(`${API_BASE_URL}/auth/logout`, { method: "POST", credentials: "include" });
+  } finally {
+    authSession.clear();
+  }
 }
 
 export async function getHealth(): Promise<Health> {

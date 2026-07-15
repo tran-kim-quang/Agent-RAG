@@ -5,6 +5,7 @@ import { Bot, Loader2, Paperclip, Plus, Send, Square } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { createChatRun, getChatRun, getUploadStatus, listChatSessions, uploadDocument, type AgentRunEvent, type ChatSession } from "@/lib/api/backend";
+import { isAuthenticationExpiredError } from "@/lib/api/auth-session";
 import type { ChatMessage, ReasoningStep } from "@/lib/types";
 import { Panel, StatusPill } from "./ui";
 
@@ -171,19 +172,21 @@ export function ChatView({
               chatPollTimer.current = null;
             }
           })
-          .catch((error: Error) => {
+          .catch((error: unknown) => {
             window.clearInterval(timer);
             chatPollTimer.current = null;
+            if (isAuthenticationExpiredError(error)) return;
             setStatus("error");
             setStatusLabel("Error");
             setChatMessages((current) => [
               ...current.filter((item) => item.id !== `pending-${run.run_id}`),
-              { id: `poll-error-${run.run_id}`, role: "assistant", content: error.message, error: true },
+              { id: `poll-error-${run.run_id}`, role: "assistant", content: error instanceof Error ? error.message : "Chat polling failed.", error: true },
             ]);
           });
       }, 1200);
       chatPollTimer.current = timer;
     } catch (error) {
+      if (isAuthenticationExpiredError(error)) return;
       setStatus("error");
       setStatusLabel("Error");
       setChatMessages((current) => [
@@ -278,15 +281,16 @@ export function ChatView({
               setStatusLabel(job.status === "completed" ? "Indexed" : "Failed");
             }
           })
-          .catch((error: Error) => {
+          .catch((error: unknown) => {
             window.clearInterval(timer);
             setUploading(false);
+            if (isAuthenticationExpiredError(error)) return;
             setStatus("error");
             setStatusLabel("Upload error");
             setChatMessages((current) =>
               current.map((message) =>
                 message.id === uploadMessageId
-                  ? { ...message, content: error.message, pending: false, error: true }
+                  ? { ...message, content: error instanceof Error ? error.message : "Upload polling failed.", pending: false, error: true }
                   : message,
               ),
             );
@@ -294,6 +298,7 @@ export function ChatView({
       }, 2000);
     } catch (error) {
       setUploading(false);
+      if (isAuthenticationExpiredError(error)) return;
       setStatus("error");
       setStatusLabel("Upload error");
       setChatMessages((current) =>

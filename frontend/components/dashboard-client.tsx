@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { getHealth, logout, refreshSession, type AgentRunEvent, type User } from "@/lib/api/backend";
+import { getHealth, logout, refreshSession, subscribeAuthSession, type AgentRunEvent, type User } from "@/lib/api/backend";
 import type { AwaitedReturn } from "@/lib/utility-types";
 import { getDashboardData } from "@/lib/api/dashboard";
 import type { ReasoningStep, ViewId } from "@/lib/types";
@@ -24,6 +24,13 @@ export function DashboardClient({ data }: { data: DashboardData }) {
 
   useEffect(() => {
     refreshSession().then((auth) => setUser(auth.user)).catch(() => setUser(null)).finally(() => setAuthLoading(false));
+  }, []);
+
+  useEffect(() => {
+    return subscribeAuthSession((auth) => {
+      setUser(auth?.user ?? null);
+      if (!auth) setActiveView("chat");
+    });
   }, []);
 
   useEffect(() => {
