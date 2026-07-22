@@ -3,7 +3,6 @@ FROM python:3.12-slim
 WORKDIR /app
 
 ENV HF_HOME=/opt/hf-cache \
-    MODEL_CORRECTION_VIETNAMESE_LOCAL=protonx-models/protonx-legal-tc \
     DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
@@ -30,20 +29,20 @@ COPY . .
 RUN --mount=type=secret,id=hf_token,required=false python - <<'PY'
 from pathlib import Path
 
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-model_id = "protonx-models/protonx-legal-tc"
 cache_dir = "/opt/hf-cache"
 token_path = Path("/run/secrets/hf_token")
 token = token_path.read_text(encoding="utf-8").strip() if token_path.exists() else None
-AutoTokenizer.from_pretrained(model_id, cache_dir=cache_dir, token=token)
-AutoModelForSeq2SeqLM.from_pretrained(
-    model_id,
+reranker_id = "BAAI/bge-reranker-v2-m3"
+AutoTokenizer.from_pretrained(reranker_id, cache_dir=cache_dir, token=token)
+AutoModelForSequenceClassification.from_pretrained(
+    reranker_id,
     cache_dir=cache_dir,
     token=token,
     low_cpu_mem_usage=True,
 )
-print(f"Preloaded correction model: {model_id}")
+print(f"Preloaded reranker model: {reranker_id}")
 PY
 
 ENTRYPOINT ["python", "-m", "backend.main"]

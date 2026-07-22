@@ -41,7 +41,12 @@ def get_orchestrator():
     )
 
 
-def run(query: str, thread_id: str, history: list[dict[str, str]] | None = None) -> str:
+def run(
+    query: str,
+    thread_id: str,
+    history: list[dict[str, str]] | None = None,
+    token_callback=None,
+) -> str:
     """Run the full multi-agent pipeline with a user query.
 
     Args:
@@ -67,8 +72,19 @@ def run(query: str, thread_id: str, history: list[dict[str, str]] | None = None)
         ]
     else:
         messages = [HumanMessage(content=query)]
-    result = get_orchestrator().invoke({"messages": messages}, config=config)
-    final_answer = result["messages"][-1].content
+    orchestrator = get_orchestrator()
+    for message_chunk, metadata in orchestrator.stream(
+        {"messages": messages},
+        config=config,
+        stream_mode="messages",
+    ):
+        if token_callback is None or metadata.get("langgraph_node") != "agent":
+            continue
+        content = _message_text(message_chunk.content)
+        if content:
+            token_callback(content)
+    state = orchestrator.get_state(config)
+    final_answer = _message_text(state.values["messages"][-1].content)
     agent_run_monitor.append_event(
         "orchestrator_complete",
         "Orchestrator finished the workflow and returned a final answer.",
@@ -77,3 +93,15 @@ def run(query: str, thread_id: str, history: list[dict[str, str]] | None = None)
     )
     logger.info("[orchestrator/query] Query handled successfully")
     return final_answer
+
+
+def _message_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(content or "")

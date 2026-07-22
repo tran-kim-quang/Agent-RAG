@@ -40,6 +40,21 @@ def get_job(job_id: str, user: CurrentUser) -> UploadStatusResponse:
     return present_upload(job)
 
 
+@router.post("/upload/{job_id}/retry", response_model=UploadStatusResponse, status_code=202)
+def retry_job(job_id: str, request: Request, user: CurrentUser) -> UploadStatusResponse:
+    enforce_rate_limit(request, "upload-retry", user.id, 20, 3600)
+    try:
+        job = upload_jobs.retry_upload_job(job_id, user.id, is_admin=is_admin(user.role))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not enqueue upload retry: job_id=%s", job_id)
+        raise HTTPException(status_code=503, detail="Upload queue is temporarily unavailable.") from exc
+    if job is None:
+        raise HTTPException(status_code=404, detail="Upload job not found.")
+    return present_upload(job)
+
+
 @router.get("/upload/{job_id}/download")
 def download(job_id: str, user: CurrentUser) -> StreamingResponse:
     result = upload_jobs.get_download(job_id, user.id, is_admin=is_admin(user.role))

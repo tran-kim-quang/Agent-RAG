@@ -1,3 +1,5 @@
+import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -16,9 +18,11 @@ from backend.process_raw_data.vision_service import (
     describe_page_visuals,
 )
 from backend.src.core.models import DocumentRecord
+from backend.src.core.ports import ProgressCallback
 
 _MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+logger = logging.getLogger(__name__)
 
 
 def _get_pdf_reader_class():
@@ -125,16 +129,27 @@ def _build_page_visual_section(page_number: int, description: str) -> str:
     return f"[Page visual understanding: {page_number}]\n{description.strip()}"
 
 
-def _extract_pdf_embedded_image_sections(page, page_number: int) -> list[str]:
+def _extract_pdf_embedded_image_sections(
+    page,
+    page_number: int,
+    max_images: int,
+    min_image_bytes: int,
+) -> tuple[list[str], int]:
     sections = []
+    attempted = 0
     for image_index, image in enumerate(getattr(page, "images", []), start=1):
+        if attempted >= max_images:
+            break
+        if len(image.data) < min_image_bytes:
+            continue
+        attempted += 1
         image_name = getattr(image, "name", None) or f"page-{page_number}-image-{image_index}.png"
         try:
             description = describe_image_bytes(image.data, image_name=image_name)
         except Exception:
             continue
         sections.append(_build_image_section(image_name, description))
-    return sections
+    return sections, attempted
 
 
 def _get_pdf_page_count(pdf_path: Path, reader=None) -> int:
@@ -170,14 +185,14 @@ class BaseFileProcessor:
     def supports(self, path: Path) -> bool:
         return path.suffix.lower() in self.supported_suffixes
 
-    def process(self, path: Path) -> DocumentRecord:
+    def process(self, path: Path, progress_callback: ProgressCallback | None = None) -> DocumentRecord:
         raise NotImplementedError
 
 
 class MarkdownProcessor(BaseFileProcessor):
     supported_suffixes = {".md"}
 
-    def process(self, path: Path) -> DocumentRecord:
+    def process(self, path: Path, progress_callback: ProgressCallback | None = None) -> DocumentRecord:
         content = path.read_text(encoding="utf-8", errors="replace")
         image_sections = []
 
@@ -201,7 +216,7 @@ class MarkdownProcessor(BaseFileProcessor):
 class ImageProcessor(BaseFileProcessor):
     supported_suffixes = set(_IMAGE_SUFFIXES)
 
-    def process(self, path: Path) -> DocumentRecord:
+    def process(self, path: Path, progress_callback: ProgressCallback | None = None) -> DocumentRecord:
         description = describe_image_file(path)
         return DocumentRecord(
             content=_build_image_section(path.name, description),
@@ -227,13 +242,33 @@ class PdfProcessor(BaseFileProcessor):
             describe_image_bytes_fn=describe_image_bytes,
         )
 
-    def process(self, path: Path) -> DocumentRecord:
+    def process(self, path: Path, progress_callback: ProgressCallback | None = None) -> DocumentRecord:
         reader_class = _get_pdf_reader_class()
         reader = reader_class(str(path)) if reader_class is not None else None
         page_count = _get_pdf_page_count(path, reader=reader)
+        image_budget = max(0, int(os.getenv("PDF_MAX_EMBEDDED_IMAGES", "12")))
+        min_image_bytes = max(0, int(os.getenv("PDF_MIN_EMBEDDED_IMAGE_BYTES", "8192")))
         sections = []
         for page_number in range(1, page_count + 1):
-            sections.extend(self._process_page(path, page_number, reader=reader))
+            page_sections, attempted_images = self._process_page(
+                path,
+                page_number,
+                reader=reader,
+                embedded_image_limit=image_budget,
+                min_image_bytes=min_image_bytes,
+            )
+            image_budget -= attempted_images
+            sections.extend(page_sections)
+            if progress_callback is not None:
+                progress_callback(
+                    "process",
+                    f"Processed PDF page {page_number} of {page_count}.",
+                    {
+                        "progress": 20 + int((page_number / page_count) * 14),
+                        "current_page": page_number,
+                        "total_pages": page_count,
+                    },
+                )
 
         return DocumentRecord(
             content="\n\n".join(section for section in sections if section.strip()),
@@ -244,16 +279,38 @@ class PdfProcessor(BaseFileProcessor):
             },
         )
 
-    def _process_page(self, pdf_path: Path, page_number: int, reader=None) -> list[str]:
+    def _process_page(
+        self,
+        pdf_path: Path,
+        page_number: int,
+        reader=None,
+        embedded_image_limit: int = 0,
+        min_image_bytes: int = 0,
+    ) -> tuple[list[str], int]:
         page_text = self._dependencies.read_page_text(pdf_path, page_number, reader)
         if page_text:
             sections = [page_text]
-            if reader is not None:
-                sections.extend(_extract_pdf_embedded_image_sections(reader.pages[page_number - 1], page_number))
-            return sections
+            attempted_images = 0
+            if reader is not None and embedded_image_limit > 0:
+                image_sections, attempted_images = _extract_pdf_embedded_image_sections(
+                    reader.pages[page_number - 1],
+                    page_number,
+                    embedded_image_limit,
+                    min_image_bytes,
+                )
+                sections.extend(image_sections)
+            return sections, attempted_images
 
         image_name, image_bytes = self._dependencies.render_page_to_image(pdf_path, page_number)
-        classification = self._dependencies.classify_page_image(image_bytes, image_name)
+        try:
+            classification = self._dependencies.classify_page_image(image_bytes, image_name)
+        except Exception as exc:
+            logger.warning(
+                "[pdf/vision] Page classification failed; falling back to OCR: page=%s error=%s",
+                page_number,
+                exc,
+            )
+            classification = {"label": "text_only", "reason": "vision unavailable"}
         label = classification.get("label", "text_only")
 
         sections = []
@@ -264,17 +321,25 @@ class PdfProcessor(BaseFileProcessor):
                 sections.append(_build_page_ocr_section(page_number, corrected_text))
 
         if label in {"text_with_complex_visuals", "visual_only_or_diagram"}:
-            visual_description = self._dependencies.describe_page_visuals(image_bytes, image_name)
+            try:
+                visual_description = self._dependencies.describe_page_visuals(image_bytes, image_name)
+            except Exception as exc:
+                logger.warning(
+                    "[pdf/vision] Visual description failed; continuing without it: page=%s error=%s",
+                    page_number,
+                    exc,
+                )
+                visual_description = ""
             if visual_description.strip():
                 sections.append(_build_page_visual_section(page_number, visual_description))
 
-        return sections
+        return sections, 0
 
 
 class DocxProcessor(BaseFileProcessor):
     supported_suffixes = {".docx"}
 
-    def process(self, path: Path) -> DocumentRecord:
+    def process(self, path: Path, progress_callback: ProgressCallback | None = None) -> DocumentRecord:
         text_content, image_sections = self._extract_text_and_images(path)
         return DocumentRecord(
             content=_append_image_understanding(text_content, image_sections),
@@ -325,16 +390,23 @@ class DocumentProcessingService:
             ]
         )
 
-    def process(self, file_path: str | Path) -> DocumentRecord | None:
+    def process(
+        self,
+        file_path: str | Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> DocumentRecord | None:
         path = Path(file_path)
         for processor in self._processors:
             if processor.supports(path):
-                return processor.process(path)
+                return processor.process(path, progress_callback)
         return None
 
 
-def process_file(file_path: str | Path) -> dict | None:
-    document = DocumentProcessingService().process(file_path)
+def process_file(
+    file_path: str | Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict | None:
+    document = DocumentProcessingService().process(file_path, progress_callback)
     if document is None:
         return None
     return document.to_dict()

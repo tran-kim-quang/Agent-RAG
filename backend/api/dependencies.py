@@ -5,9 +5,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from dotenv import load_dotenv
 
 from backend.src.core.roles import is_admin
-from backend.src.db import Database, SqlChatRepository, SqlDocumentRepository, SqlRefreshTokenRepository, SqlUploadRepository, SqlUserRepository, User
+from backend.src.db import Database, SqlChatRepository, SqlDocumentRepository, SqlKnowledgeBaseRepository, SqlRefreshTokenRepository, SqlUploadRepository, SqlUserRepository, User
+from backend.src.index.graph_index import Neo4jGraphRepository
 from backend.src.security import AuthService, TokenError
-from backend.src.services import ChatRunService, GraphQueryService, UploadJobService
+from backend.src.services import ChatRunService, DocumentDeletionService, GraphQueryService, UploadJobService
 from backend.src.storage import MinioObjectStorage
 
 load_dotenv()
@@ -18,10 +19,13 @@ tokens = SqlRefreshTokenRepository(database)
 chats = SqlChatRepository(database)
 uploads = SqlUploadRepository(database)
 documents = SqlDocumentRepository(database)
+knowledge_bases = SqlKnowledgeBaseRepository(database)
+graphs = Neo4jGraphRepository()
 auth_service = AuthService(users, tokens)
 object_storage = MinioObjectStorage()
 chat_runs = ChatRunService(chats)
-graph_queries = GraphQueryService()
+graph_queries = GraphQueryService(graphs)
+document_deletions = DocumentDeletionService(graphs, documents, knowledge_bases)
 upload_jobs = UploadJobService(uploads, object_storage)
 bearer_scheme = HTTPBearer(auto_error=False)
 

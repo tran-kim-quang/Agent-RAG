@@ -92,3 +92,28 @@ def test_upload_is_stored_before_enqueue_and_enforces_ownership(database: Databa
     assert queued[0][3] == job["raw_object_key"]
     assert service.get_upload_job(job["job_id"], owner.id) is not None
     assert service.get_upload_job(job["job_id"], stranger.id) is None
+
+
+def test_failed_upload_can_be_retried_once_by_its_owner(database: Database) -> None:
+    users = SqlUserRepository(database)
+    owner = users.create("retry-owner@example.com", "hash")
+    stranger = users.create("retry-stranger@example.com", "hash")
+    uploads = SqlUploadRepository(database)
+    queued: list[tuple[str, str, str, str]] = []
+    service = UploadJobService(
+        uploads,
+        FakeObjectStorage(),  # type: ignore[arg-type]
+        enqueue=lambda job_id, user_id, name, key: queued.append((job_id, user_id, name, key)) or "retry-task",
+    )
+    job = service.create_upload_job("failed.pdf", b"pdf-content", owner.id, "application/pdf")
+    uploads.update(job["job_id"], status="failed", phase="failed", error="worker stopped")
+
+    assert service.retry_upload_job(job["job_id"], stranger.id) is None
+    retried = service.retry_upload_job(job["job_id"], owner.id)
+
+    assert retried is not None
+    assert retried["status"] == "queued"
+    assert retried["error"] is None
+    assert len(queued) == 2
+    with pytest.raises(ValueError, match="Only failed"):
+        service.retry_upload_job(job["job_id"], owner.id)

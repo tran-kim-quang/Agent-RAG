@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "r
 import { Bot, Loader2, Paperclip, Plus, Send, Square } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { createChatRun, getChatRun, getUploadStatus, listChatSessions, uploadDocument, type AgentRunEvent, type ChatSession } from "@/lib/api/backend";
+import { connectChatRunStream, createChatRun, getChatRun, getUploadStatus, listChatSessions, uploadDocument, type AgentRunEvent, type ChatSession, type ChatStreamEvent } from "@/lib/api/backend";
 import { isAuthenticationExpiredError } from "@/lib/api/auth-session";
 import type { ChatMessage, ReasoningStep } from "@/lib/types";
 import { Panel, StatusPill } from "./ui";
@@ -28,8 +28,10 @@ export function ChatView({
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const completedRuns = useRef(new Set<string>());
+  const stoppedRuns = useRef(new Set<string>());
+  const activeRunId = useRef<string | null>(null);
   const chatPollTimer = useRef<number | null>(null);
-  const streamTimer = useRef<number | null>(null);
+  const chatStreamSocket = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -38,6 +40,10 @@ export function ChatView({
 
   useEffect(() => {
     listChatSessions().then(setSessions).catch(() => setSessions([]));
+    return () => {
+      if (chatPollTimer.current) window.clearInterval(chatPollTimer.current);
+      chatStreamSocket.current?.close(1000, "View closed");
+    };
   }, []);
 
   function openSession(session: ChatSession) {
@@ -67,15 +73,15 @@ export function ChatView({
     setStatusLabel(run.status === "processing" ? "Thinking" : run.status);
 
     if (run.status === "completed" && !completedRuns.current.has(runId)) {
-      completedRuns.current.add(runId);
-      streamAssistantAnswer(runId, run.answer ?? "The backend completed without an answer payload.");
+      completeAssistantAnswer(runId, run.answer ?? "The backend completed without an answer payload.");
       return true;
     }
 
     if (run.status === "failed" && !completedRuns.current.has(runId)) {
       completedRuns.current.add(runId);
+      activeRunId.current = null;
       setChatMessages((current) => [
-        ...current.filter((message) => message.id !== `pending-${runId}`),
+        ...current.filter((message) => message.id !== `pending-${runId}` && message.id !== `answer-${runId}`),
         {
           id: `error-${runId}`,
           role: "assistant",
@@ -89,51 +95,77 @@ export function ChatView({
     return false;
   }
 
-  function streamAssistantAnswer(runId: string, answer: string) {
-    if (streamTimer.current) {
-      window.clearInterval(streamTimer.current);
-    }
-
+  function completeAssistantAnswer(runId: string, answer: string) {
+    completedRuns.current.add(runId);
+    activeRunId.current = null;
     const answerId = `answer-${runId}`;
-    setStatus("loading");
-    setStatusLabel("Streaming");
     setChatMessages((current) => [
-      ...current.filter((message) => message.id !== `pending-${runId}`),
-      {
-        id: answerId,
-        role: "assistant",
-        content: "",
-        pending: true,
-      },
+      ...current.filter((message) => message.id !== `pending-${runId}` && message.id !== answerId),
+      { id: answerId, role: "assistant", content: answer, pending: false },
     ]);
+    setStatus("success");
+    setStatusLabel("Completed");
+    listChatSessions().then(setSessions).catch(() => undefined);
+  }
 
-    let cursor = 0;
-    const chunkSize = Math.max(2, Math.ceil(answer.length / 160));
-    streamTimer.current = window.setInterval(() => {
-      cursor = Math.min(answer.length, cursor + chunkSize);
-      const nextContent = answer.slice(0, cursor);
+  function handleStreamEvent(runId: string, event: ChatStreamEvent) {
+    const answerId = `answer-${runId}`;
+    if (event.type === "start") {
+      setStatus("loading");
+      setStatusLabel("Thinking");
       setChatMessages((current) =>
-        current.map((message) =>
-          message.id === answerId
-            ? {
-                ...message,
-                content: nextContent,
-                pending: cursor < answer.length,
-              }
-            : message,
-        ),
+        [...current.filter((message) => message.id !== `pending-${runId}` && message.id !== answerId), { id: answerId, role: "assistant", content: "", pending: true }],
       );
+      return;
+    }
+    if (event.type === "token") {
+      setStatusLabel("Streaming");
+      setChatMessages((current) => current.map((message) => message.id === answerId ? { ...message, content: message.content + event.content, pending: true } : message));
+      return;
+    }
+    if (event.type === "status") {
+      setStatusLabel(event.status);
+      return;
+    }
+    if (event.type === "done") {
+      const streamed = chatMessages.find((message) => message.id === answerId)?.content;
+      completeAssistantAnswer(runId, event.answer || streamed || "The backend completed without an answer payload.");
+      chatStreamSocket.current = null;
+      return;
+    }
+    if (event.type === "error") {
+      completedRuns.current.add(runId);
+      activeRunId.current = null;
+      setStatus("error");
+      setStatusLabel("Error");
+      setChatMessages((current) => [
+        ...current.filter((message) => message.id !== `pending-${runId}` && message.id !== answerId),
+        { id: `error-${runId}`, role: "assistant", content: event.message, error: true },
+      ]);
+      chatStreamSocket.current = null;
+    }
+  }
 
-      if (cursor >= answer.length) {
-        if (streamTimer.current) {
-          window.clearInterval(streamTimer.current);
-          streamTimer.current = null;
-        }
-        setStatus("success");
-        setStatusLabel("Completed");
-        listChatSessions().then(setSessions).catch(() => undefined);
-      }
-    }, 24);
+  function startPollingFallback(runId: string) {
+    if (chatPollTimer.current || completedRuns.current.has(runId)) return;
+    const poll = () => {
+      pollRun(runId)
+        .then((isDone) => {
+          if (isDone && chatPollTimer.current) {
+            window.clearInterval(chatPollTimer.current);
+            chatPollTimer.current = null;
+          }
+        })
+        .catch((error: unknown) => {
+          if (chatPollTimer.current) window.clearInterval(chatPollTimer.current);
+          chatPollTimer.current = null;
+          if (isAuthenticationExpiredError(error)) return;
+          setStatus("error");
+          setStatusLabel("Error");
+        });
+    };
+    void poll();
+    chatPollTimer.current = window.setInterval(poll, 1200);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -154,6 +186,8 @@ export function ChatView({
 
     try {
       const run = await createChatRun(message, activeSessionId);
+      activeRunId.current = run.run_id;
+      stoppedRuns.current.delete(run.run_id);
       setActiveSessionId(run.chat_session_id);
       onEvents(run.events);
       setChatMessages((current) => [
@@ -161,30 +195,13 @@ export function ChatView({
         { id: `pending-${run.run_id}`, role: "assistant", content: run.message || "Agent is thinking...", pending: true },
       ]);
 
-      const done = await pollRun(run.run_id);
-      if (done) return;
-
-      const timer = window.setInterval(() => {
-        pollRun(run.run_id)
-          .then((isDone) => {
-            if (isDone) {
-              window.clearInterval(timer);
-              chatPollTimer.current = null;
-            }
-          })
-          .catch((error: unknown) => {
-            window.clearInterval(timer);
-            chatPollTimer.current = null;
-            if (isAuthenticationExpiredError(error)) return;
-            setStatus("error");
-            setStatusLabel("Error");
-            setChatMessages((current) => [
-              ...current.filter((item) => item.id !== `pending-${run.run_id}`),
-              { id: `poll-error-${run.run_id}`, role: "assistant", content: error instanceof Error ? error.message : "Chat polling failed.", error: true },
-            ]);
-          });
-      }, 1200);
-      chatPollTimer.current = timer;
+      chatStreamSocket.current = await connectChatRunStream(
+        run.run_id,
+        (streamEvent) => handleStreamEvent(run.run_id, streamEvent),
+        () => {
+          if (!stoppedRuns.current.has(run.run_id)) startPollingFallback(run.run_id);
+        },
+      );
     } catch (error) {
       if (isAuthenticationExpiredError(error)) return;
       setStatus("error");
@@ -202,18 +219,24 @@ export function ChatView({
   }
 
   function handleStop() {
+    const runId = activeRunId.current;
+    const hadActiveRun = Boolean(runId || chatStreamSocket.current || chatPollTimer.current);
+    if (runId) stoppedRuns.current.add(runId);
+    activeRunId.current = null;
+    if (chatStreamSocket.current) {
+      chatStreamSocket.current.close(1000, "Stopped locally");
+      chatStreamSocket.current = null;
+    }
     if (chatPollTimer.current) {
       window.clearInterval(chatPollTimer.current);
       chatPollTimer.current = null;
+    }
+    if (hadActiveRun) {
       setStatus("idle");
       setStatusLabel("Stopped");
-      if (streamTimer.current) {
-        window.clearInterval(streamTimer.current);
-        streamTimer.current = null;
-      }
       setChatMessages((current) =>
         current.map((message) =>
-          message.pending ? { ...message, content: `${message.content}\nPolling stopped locally.`, pending: false } : message,
+          message.pending ? { ...message, content: `${message.content}\nStopped locally.`, pending: false } : message,
         ),
       );
     } else {

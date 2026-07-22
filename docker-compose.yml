@@ -19,6 +19,7 @@ x-app-base: &app-base
     MINIO_BUCKET: ${MINIO_BUCKET:-agent-rag}
     MINIO_SECURE: "false"
     OLLAMA_LOCAL_URL: http://ollama:11434/v1
+    MODEL_CORRECTION_BACKEND: disabled
   volumes:
     - ./data:/app/data
 
@@ -26,10 +27,13 @@ services:
   ollama:
     image: ollama/ollama
     gpus: all
+    environment:
+      OLLAMA_KEEP_ALIVE: "-1"
+      OLLAMA_NUM_PARALLEL: "2"
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
-      test: ["CMD", "ollama", "list"]
+      test: ["CMD-SHELL", "ollama show ${EMBEDDING_MODEL_NAME:-qwen3-embedding:4b} > /dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 15
@@ -38,7 +42,7 @@ services:
     command: >
       "ollama serve &
       until ollama list > /dev/null 2>&1; do sleep 2; done &&
-      ollama pull ${EMBEDDING_MODEL_NAME:-nomic-embed-text} &&
+      ollama pull ${EMBEDDING_MODEL_NAME:-qwen3-embedding:4b} &&
       wait"
 
   postgres:
@@ -118,12 +122,17 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
 
-  worker:
+  worker-chat:
     <<: *app-base
     gpus: all
     entrypoint: ["/bin/sh", "-c"]
-    command: ["celery -A backend.src.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency=$${WORKER_CONCURRENCY:-2}"]
+    command: ["celery -A backend.src.tasks.celery_app:celery_app worker --loglevel=INFO --pool=solo --concurrency=$${CHAT_WORKER_CONCURRENCY:-1} -Q chat"]
+    environment:
+      <<: *app-environment
+      WORKER_ROLE: chat
     depends_on:
       backend:
         condition: service_started
@@ -132,6 +141,38 @@ services:
       minio:
         condition: service_healthy
       neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
+  worker-ingest:
+    <<: *app-base
+    image: agent-rag-ingest:${APP_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: backend/process_raw_data/Dockerfile
+      args:
+        APP_IMAGE_TAG: ${APP_IMAGE_TAG:-local}
+      secrets:
+        - hf_token
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["celery -A backend.src.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency=$${INGEST_WORKER_CONCURRENCY:-1} -Q ingest,maintenance"]
+    environment:
+      <<: *app-environment
+      WORKER_ROLE: ingest
+      MODEL_CORRECTION_BACKEND: local
+      MODEL_CORRECTION_DEVICE: cpu
+      MODEL_CORRECTION_IDLE_SECONDS: ${MODEL_CORRECTION_IDLE_SECONDS:-300}
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
 
   beat:
@@ -149,15 +190,17 @@ services:
       context: .
       dockerfile: backend/process_raw_data/Dockerfile
       args:
-        APP_BUILD_REV: ${APP_BUILD_REV:-local}
+        APP_IMAGE_TAG: ${APP_IMAGE_TAG:-local}
       secrets:
         - hf_token
     profiles: [tools]
-    gpus: all
     env_file: .env
     environment:
       RAW_DATA_DIR: /app/data/raw
       PROCESSED_DATA_DIR: /app/data/processed
+      MODEL_CORRECTION_BACKEND: local
+      MODEL_CORRECTION_DEVICE: cpu
+      MODEL_CORRECTION_IDLE_SECONDS: ${MODEL_CORRECTION_IDLE_SECONDS:-300}
     volumes:
       - ./data:/app/data
 

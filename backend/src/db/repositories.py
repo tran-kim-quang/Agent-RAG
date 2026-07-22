@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import selectinload
 
 from backend.src.db.models import ChatMessage, ChatRun, ChatSession, Document, RefreshToken, UploadJob, User
@@ -135,6 +135,38 @@ class SqlUploadRepository:
             for key, value in updates.items():
                 if hasattr(item, key): setattr(item, key, value)
             item.updated_at = datetime.now(timezone.utc)
+    def claim_retry(self, job_id: str, user_id: str | None = None) -> bool:
+        now = datetime.now(timezone.utc)
+        statement = (
+            update(UploadJob)
+            .where(UploadJob.id == job_id, UploadJob.status == "failed")
+            .values(
+                status="queued",
+                phase="queued",
+                message="Upload retry queued.",
+                progress=1,
+                task_id=None,
+                worker_id=None,
+                heartbeat_at=None,
+                started_at=None,
+                finished_at=None,
+                error=None,
+                raw_path=None,
+                processed_path=None,
+                metadata_path=None,
+                processed_object_key=None,
+                metadata_object_key=None,
+                chunk_count=None,
+                indexed_chunks=0,
+                total_chunks=None,
+                source_name=None,
+                updated_at=now,
+            )
+        )
+        if user_id is not None:
+            statement = statement.where(UploadJob.user_id == user_id)
+        with self.database.session() as session:
+            return bool(session.execute(statement).rowcount)
     def get(self, job_id: str) -> UploadJob | None:
         with self.database.session() as session: return session.get(UploadJob, job_id)
     def list(self, user_id: str | None, limit: int = 20) -> list[UploadJob]:
@@ -162,6 +194,11 @@ class SqlDocumentRepository:
             item.raw_path, item.metadata_path, item.chunk_count = job.raw_path, job.metadata_path, job.chunk_count or 0
             item.updated_at = datetime.now(timezone.utc)
             session.add(item)
+    def delete_by_source(self, user_id: str, source: str) -> bool:
+        statement = delete(Document).where(Document.user_id == user_id, Document.source == source)
+        with self.database.session() as session:
+            result = session.execute(statement)
+            return bool(result.rowcount)
 
 
 def _as_utc(value: datetime) -> datetime:

@@ -9,6 +9,8 @@ from backend.src.infrastructure import create_neo4j_driver, get_ollama_embedding
 from backend.src.infrastructure.retrieval_cache import RedisRetrievalCache
 from backend.src.db import Database, SqlKnowledgeBaseRepository
 from backend.src.retrieval.cached_search import CachedGraphSearcher
+from backend.src.retrieval.cached_search import RetrievalOutcome
+from backend.src.retrieval.reranker import get_reranker
 
 _CFG = load_config()["retriever"]
 
@@ -154,6 +156,13 @@ def graph_search(query: str) -> list[dict]:
     return _cached_searcher().search(query, owner_id)
 
 
+def graph_search_with_artifact(query: str) -> RetrievalOutcome | None:
+    owner_id = current_user_id()
+    if owner_id is None:
+        return None
+    return _cached_searcher().search_with_artifact(query, owner_id)
+
+
 @lru_cache(maxsize=1)
 def _cached_searcher() -> CachedGraphSearcher:
     return CachedGraphSearcher(
@@ -161,4 +170,5 @@ def _cached_searcher() -> CachedGraphSearcher:
         cache=RedisRetrievalCache(),
         knowledge_bases=SqlKnowledgeBaseRepository(Database()),
         embeddings_factory=get_ollama_embeddings,
+        reranker=get_reranker(),
     )

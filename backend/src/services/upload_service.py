@@ -69,6 +69,37 @@ class UploadJobService:
             return None
         return self._job_to_dict(item)
 
+    def retry_upload_job(self, job_id: str, user_id: str, is_admin: bool = False) -> dict | None:
+        item = self._uploads.get(job_id)
+        if item is None or (not is_admin and item.user_id != user_id):
+            return None
+        if item.status != "failed":
+            raise ValueError("Only failed upload jobs can be retried.")
+        if not item.raw_object_key:
+            raise ValueError("The original upload is no longer available for retry.")
+
+        owner_filter = None if is_admin else user_id
+        if not self._uploads.claim_retry(job_id, owner_filter):
+            raise ValueError("Upload retry has already been queued.")
+        try:
+            task_id = self._enqueue(job_id, item.user_id, item.file_name, item.raw_object_key)
+            self._uploads.update(job_id, task_id=task_id)
+        except Exception as exc:
+            self._uploads.update(
+                job_id,
+                status="failed",
+                phase="failed",
+                message=f"Could not retry '{item.file_name}'.",
+                error=str(exc),
+                finished_at=datetime.now(timezone.utc),
+            )
+            raise
+
+        retried = self._uploads.get(job_id)
+        if retried is None:
+            raise RuntimeError("Retried upload job was not persisted.")
+        return self._job_to_dict(retried)
+
     def list_upload_jobs(self, limit: int = 20, user_id: str | None = None) -> list[dict]:
         return [self._job_to_dict(job) for job in self._uploads.list(user_id=user_id, limit=limit)]
 

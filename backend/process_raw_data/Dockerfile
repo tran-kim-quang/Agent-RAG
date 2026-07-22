@@ -1,29 +1,9 @@
-FROM python:3.12-slim
+ARG APP_IMAGE_TAG=local
+FROM agent-rag-app:${APP_IMAGE_TAG}
 
-WORKDIR /app
-
-ENV HF_HOME=/opt/hf-cache \
-    MODEL_CORRECTION_VIETNAMESE_LOCAL=protonx-models/protonx-legal-tc \
-    DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-    curl \
-    poppler-utils \
-    tesseract-ocr \
-    tesseract-ocr-vie \
- && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir "poetry>=2.0.0,<3.0.0"
-
-COPY pyproject.toml poetry.lock ./
-
-RUN poetry config virtualenvs.create false \
- && poetry config installer.parallel false \
- && poetry install --no-root --no-interaction
-
-ARG APP_BUILD_REV=dev
-RUN printf '%s\n' "$APP_BUILD_REV" > /tmp/app_build_rev
+ENV MODEL_CORRECTION_VIETNAMESE_LOCAL=protonx-models/protonx-legal-tc \
+    MODEL_CORRECTION_BACKEND=local \
+    MODEL_CORRECTION_DEVICE=cpu
 
 COPY . .
 
@@ -43,7 +23,7 @@ AutoModelForSeq2SeqLM.from_pretrained(
     token=token,
     low_cpu_mem_usage=True,
 )
-print(f"Preloaded correction model: {model_id}")
+print(f"Preloaded OCR correction model: {model_id}")
 PY
 
 ENTRYPOINT ["python", "-m", "backend.process_raw_data"]

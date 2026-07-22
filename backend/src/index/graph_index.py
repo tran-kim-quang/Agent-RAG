@@ -73,19 +73,17 @@ class Neo4jGraphIndexer:
                 )
                 session.run(
                     """
-                    MERGE (d:Document {source: $source})
+                    MERGE (d:Document {source: $source, owner_id: $owner_id})
                     SET d.name                    = $document_name,
-                        d.owner_id                = $owner_id,
                         d.raw_source              = $raw_source,
                         d.processed_metadata_path = $processed_metadata_path,
                         d.original_file_name      = $original_file_name,
                         d.source_type             = $source_type,
                         d.updated_at              = datetime(),
                         d.chunk_count             = $total_chunks
-                    MERGE (c:Chunk {id: $id})
+                    MERGE (c:Chunk {id: $id, owner_id: $owner_id})
                     SET c.text        = $text,
                         c.source      = $source,
-                        c.owner_id    = $owner_id,
                         c.chunk_index = $chunk_index,
                         c.updated_at  = datetime()
                     MERGE (d)-[:HAS_CHUNK]->(c)
@@ -165,10 +163,12 @@ class Neo4jGraphRepository:
                 """
                 MATCH (c:Chunk)
                 WHERE $owner_id IS NULL OR c.owner_id = $owner_id
-                WITH c.source AS source, count(c) AS actual_chunk_nodes, max(c.updated_at) AS chunk_updated_at
-                OPTIONAL MATCH (d:Document {source: source})
+                WITH c.source AS source, c.owner_id AS owner_id,
+                     count(c) AS actual_chunk_nodes, max(c.updated_at) AS chunk_updated_at
+                OPTIONAL MATCH (d:Document {source: source, owner_id: owner_id})
                 RETURN
                     source AS source,
+                    owner_id AS owner_id,
                     coalesce(d.name, source) AS name,
                     d.raw_source AS raw_source,
                     d.original_file_name AS original_file_name,
@@ -198,6 +198,7 @@ class Neo4jGraphRepository:
                 WITH d, count(c) AS actual_chunk_nodes, max(c.updated_at) AS chunk_updated_at
                 RETURN
                     $source AS source,
+                    coalesce(d.owner_id, $owner_id) AS owner_id,
                     coalesce(d.name, $source) AS name,
                     d.raw_source AS raw_source,
                     d.original_file_name AS original_file_name,
@@ -259,6 +260,27 @@ class Neo4jGraphRepository:
             "edges": edges,
         }
 
+    def delete_document(self, source: str, owner_id: str) -> bool:
+        driver = self._driver_factory()
+        try:
+            with driver.session() as session:
+                result = session.run(
+                    """
+                    OPTIONAL MATCH (d:Document {source: $source, owner_id: $owner_id})
+                    WITH [node IN collect(d) WHERE node IS NOT NULL] AS documents
+                    OPTIONAL MATCH (c:Chunk {source: $source, owner_id: $owner_id})
+                    WITH documents, [node IN collect(c) WHERE node IS NOT NULL] AS chunks
+                    FOREACH (document IN documents | DETACH DELETE document)
+                    FOREACH (chunk IN chunks | DETACH DELETE chunk)
+                    RETURN size(documents) + size(chunks) AS deleted
+                    """,
+                    source=source,
+                    owner_id=owner_id,
+                ).single()
+                return result is not None and int(result["deleted"]) > 0
+        finally:
+            driver.close()
+
 
 def build_graph_index(
     chunks: list[dict],
@@ -266,13 +288,3 @@ def build_graph_index(
 ) -> None:
     indexer = Neo4jGraphIndexer()
     indexer.build_index([ChunkRecord.from_dict(chunk) for chunk in chunks], progress_callback=progress_callback)
-
-
-def list_graph_documents(limit: int = 20, owner_id: str | None = None) -> list[dict]:
-    return Neo4jGraphRepository().list_documents(limit=limit, owner_id=owner_id)
-
-
-def get_document_graph(source: str, limit_chunks: int = 18, owner_id: str | None = None) -> dict:
-    return Neo4jGraphRepository().get_document_graph(
-        source=source, limit_chunks=limit_chunks, owner_id=owner_id
-    )

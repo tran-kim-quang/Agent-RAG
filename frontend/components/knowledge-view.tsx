@@ -1,12 +1,14 @@
 "use client";
 
 import { useEffect, useMemo, useState, type ChangeEvent, type CSSProperties, type DragEvent } from "react";
-import { CheckCircle2, CloudUpload, FileText, Loader2, RefreshCw, Search, TriangleAlert, X } from "lucide-react";
+import { CheckCircle2, CloudUpload, FileText, Loader2, RefreshCw, RotateCcw, Search, TriangleAlert, X } from "lucide-react";
 import {
+  deleteGraphDocument,
   getGraphDocument,
   getUploadStatus,
   listGraphDocuments,
   listUploadJobs,
+  retryUploadJob,
   uploadDocument,
   type GraphDocument,
   type GraphDocumentSummary,
@@ -23,6 +25,9 @@ export function KnowledgeView({
   const [rows, setRows] = useState<DocumentRow[]>([]);
   const [graph, setGraph] = useState<GraphDocument | null>(null);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
+  const [selectedOwnerId, setSelectedOwnerId] = useState<string | null>(null);
+  const [deletingSource, setDeletingSource] = useState<string | null>(null);
+  const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [zoom, setZoom] = useState(1);
   const [status, setStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
@@ -43,7 +48,7 @@ export function KnowledgeView({
     };
   }, [rows]);
 
-  async function refreshGraph(sourceOverride?: string | null) {
+  async function refreshGraph(sourceOverride?: string | null, ownerOverride?: string | null) {
     setStatus("loading");
     setStatusLabel("Refreshing");
     onLocalEvent("graph documents", "Loading indexed documents from Neo4j.", "loading");
@@ -51,10 +56,18 @@ export function KnowledgeView({
     const nextRows = mergeGraphRowsAndUploadJobs(summaries, jobs);
     setRows(nextRows);
 
-    const nextSource = sourceOverride ?? selectedSource ?? summaries[0]?.source ?? null;
+    const selectedSummary = sourceOverride === undefined
+      ? summaries.find((item) => item.source === selectedSource && item.owner_id === selectedOwnerId)
+      : sourceOverride
+        ? summaries.find((item) => item.source === sourceOverride && (!ownerOverride || item.owner_id === ownerOverride))
+        : undefined;
+    const nextSummary = selectedSummary ?? summaries[0] ?? null;
+    const nextSource = nextSummary?.source ?? null;
+    const nextOwnerId = nextSummary?.owner_id ?? null;
     setSelectedSource(nextSource);
+    setSelectedOwnerId(nextOwnerId);
     if (nextSource) {
-      setGraph(await getGraphDocument(nextSource));
+      setGraph(await getGraphDocument(nextSource, 18, nextOwnerId));
       onLocalEvent("graph document", `Loaded graph for ${nextSource}.`, "success");
       setStatus("success");
       setStatusLabel("Visible");
@@ -75,6 +88,32 @@ export function KnowledgeView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  function monitorUploadJob(jobId: string) {
+    const timer = window.setInterval(() => {
+      getUploadStatus(jobId)
+        .then(async (job) => {
+          setUploadLabel(`${job.phase ?? job.status}: ${job.message}`);
+          onLocalEvent(job.phase ?? job.status, job.message, job.status === "completed" ? "success" : job.status === "failed" ? "error" : "loading");
+          setRows((current) => mergeUploadJobIntoRows(current, job));
+          if (job.processed_path) {
+            await refreshGraph(job.processed_path);
+          }
+          if (job.status === "completed" || job.status === "failed") {
+            window.clearInterval(timer);
+            setStatus(job.status === "completed" ? "success" : "error");
+            setStatusLabel(job.status === "completed" ? "Indexed" : "Failed");
+            await refreshGraph(job.processed_path ?? undefined);
+          }
+        })
+        .catch((error: Error) => {
+          window.clearInterval(timer);
+          setStatus("error");
+          setStatusLabel("Upload error");
+          setUploadLabel(error.message);
+        });
+    }, 2000);
+  }
+
   async function processUpload(file: File) {
     if (!file) return;
 
@@ -94,29 +133,7 @@ export function KnowledgeView({
         return;
       }
 
-      const timer = window.setInterval(() => {
-        getUploadStatus(acceptedJob.job_id as string)
-          .then(async (job) => {
-            setUploadLabel(`${job.phase ?? job.status}: ${job.message}`);
-            onLocalEvent(job.phase ?? job.status, job.message, job.status === "completed" ? "success" : job.status === "failed" ? "error" : "loading");
-            setRows((current) => mergeUploadJobIntoRows(current, job));
-            if (job.processed_path) {
-              await refreshGraph(job.processed_path);
-            }
-            if (job.status === "completed" || job.status === "failed") {
-              window.clearInterval(timer);
-              setStatus(job.status === "completed" ? "success" : "error");
-              setStatusLabel(job.status === "completed" ? "Indexed" : "Failed");
-              await refreshGraph(job.processed_path ?? undefined);
-            }
-          })
-          .catch((error: Error) => {
-            window.clearInterval(timer);
-            setStatus("error");
-            setStatusLabel("Upload error");
-            setUploadLabel(error.message);
-          });
-      }, 2000);
+      monitorUploadJob(acceptedJob.job_id);
     } catch (error) {
       setStatus("error");
       setStatusLabel("Upload error");
@@ -141,6 +158,42 @@ export function KnowledgeView({
         setStatusLabel("Upload error");
         setUploadLabel(error.message);
       });
+    }
+  }
+
+  async function handleDelete(document: DocumentRow) {
+    if (!document.graphIndexed || !document.source || !window.confirm(`Delete ${document.name} from the knowledge base?`)) return;
+    setDeletingSource(document.source);
+    setUploadLabel(`Deleting ${document.name}...`);
+    try {
+      await deleteGraphDocument(document.source, document.ownerId);
+      await refreshGraph(null);
+      setUploadLabel(`${document.name} deleted.`);
+      onLocalEvent("graph document", `Deleted ${document.name} from Neo4j.`, "success");
+    } catch (error) {
+      setUploadLabel(error instanceof Error ? error.message : "Delete failed.");
+    } finally {
+      setDeletingSource(null);
+    }
+  }
+
+  async function handleRetry(document: DocumentRow) {
+    if (!document.jobId) return;
+    setRetryingJobId(document.jobId);
+    setStatus("loading");
+    setStatusLabel("Retrying");
+    try {
+      const job = await retryUploadJob(document.jobId);
+      setRows((current) => mergeUploadJobIntoRows(current, job));
+      setUploadLabel(job.message);
+      onLocalEvent("upload retry", `Retry queued for ${document.name}.`, "loading");
+      monitorUploadJob(document.jobId);
+    } catch (error) {
+      setStatus("error");
+      setStatusLabel("Retry error");
+      setUploadLabel(error instanceof Error ? error.message : "Retry failed.");
+    } finally {
+      setRetryingJobId(null);
     }
   }
 
@@ -221,7 +274,7 @@ export function KnowledgeView({
                     className="cursor-pointer border-t border-white/10 text-sm text-rag-muted hover:bg-rag-primaryStrong/10"
                     onClick={() => {
                       if (!document.source) return;
-                      refreshGraph(document.source).catch((error: Error) => setUploadLabel(error.message));
+                      refreshGraph(document.source, document.ownerId).catch((error: Error) => setUploadLabel(error.message));
                     }}
                   >
                     <td className="px-6 py-4">
@@ -239,6 +292,21 @@ export function KnowledgeView({
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex gap-1">
+                        {document.jobId && document.tone === "error" ? (
+                          <button
+                            aria-label="Retry upload"
+                            title="Retry upload"
+                            className="focus-ring grid h-7 w-7 place-items-center rounded-rag bg-midnight-highest/70 text-rag-muted transition hover:bg-rag-secondary/15 hover:text-rag-secondary disabled:opacity-50"
+                            type="button"
+                            disabled={retryingJobId === document.jobId}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              handleRetry(document).catch((error: Error) => setUploadLabel(error.message));
+                            }}
+                          >
+                            <RotateCcw className={`h-3.5 w-3.5 ${retryingJobId === document.jobId ? "animate-spin" : ""}`} />
+                          </button>
+                        ) : null}
                         <button
                           aria-label="Refresh document"
                           className="focus-ring grid h-7 w-7 place-items-center rounded-rag bg-midnight-highest/70 text-rag-muted transition hover:bg-rag-primaryStrong/20 hover:text-rag-text"
@@ -246,7 +314,7 @@ export function KnowledgeView({
                           onClick={(event) => {
                             event.stopPropagation();
                             if (document.source) {
-                              refreshGraph(document.source).catch((error: Error) => setUploadLabel(error.message));
+                              refreshGraph(document.source, document.ownerId).catch((error: Error) => setUploadLabel(error.message));
                             } else {
                               setUploadLabel("This mock row has no backend graph source yet.");
                             }
@@ -258,9 +326,10 @@ export function KnowledgeView({
                           aria-label="Remove document"
                           className="focus-ring grid h-7 w-7 place-items-center rounded-rag bg-midnight-highest/70 text-rag-muted transition hover:bg-rag-error/15 hover:text-rag-error"
                           type="button"
+                          disabled={!document.graphIndexed || !document.source || deletingSource === document.source}
                           onClick={(event) => {
                             event.stopPropagation();
-                            setUploadLabel("Delete endpoint is not available in backend yet.");
+                            handleDelete(document).catch((error: Error) => setUploadLabel(error.message));
                           }}
                         >
                           <X className="h-3.5 w-3.5" />
@@ -293,15 +362,16 @@ export function KnowledgeView({
 function mergeGraphRowsAndUploadJobs(summaries: GraphDocumentSummary[], jobs: UploadStatus[]): DocumentRow[] {
   const rowsBySource = new Map<string, DocumentRow>();
   summaries.forEach((summary) => {
-    rowsBySource.set(summary.source, mapGraphSummaryToRow(summary));
+    rowsBySource.set(`${summary.owner_id ?? ""}:${summary.source}`, mapGraphSummaryToRow(summary));
   });
 
   jobs.forEach((job) => {
     const processedPath = job.processed_path ?? undefined;
-    if (processedPath && rowsBySource.has(processedPath) && job.status === "completed") {
-      const existing = rowsBySource.get(processedPath);
+    const documentKey = `${job.user_id ?? ""}:${processedPath ?? ""}`;
+    if (processedPath && rowsBySource.has(documentKey) && job.status === "completed") {
+      const existing = rowsBySource.get(documentKey);
       if (existing) {
-        rowsBySource.set(processedPath, {
+        rowsBySource.set(documentKey, {
           ...existing,
           status: "Indexed (Neo4j)",
           tone: "success",
@@ -310,6 +380,8 @@ function mergeGraphRowsAndUploadJobs(summaries: GraphDocumentSummary[], jobs: Up
       }
       return;
     }
+
+    if (processedPath && job.status === "completed") return;
 
     const row = mapUploadJobToRow(job);
     rowsBySource.set(row.id, row);
@@ -337,7 +409,10 @@ function mapUploadJobToRow(job: UploadStatus): DocumentRow {
 
   return {
     id: `upload-${job.job_id ?? fileName}`,
+    jobId: job.job_id ?? undefined,
     source: job.processed_path ?? undefined,
+    ownerId: job.user_id,
+    graphIndexed: false,
     name: fileName,
     type: (fileName.split(".").pop() ?? "doc").toUpperCase(),
     dateAdded: "Current session",
@@ -521,8 +596,10 @@ function mapGraphSummaryToRow(summary: GraphDocumentSummary): DocumentRow {
   const isProcessing = total > 0 && indexed < total;
 
   return {
-    id: summary.source,
+    id: `${summary.owner_id ?? ""}:${summary.source}`,
     source: summary.source,
+    ownerId: summary.owner_id,
+    graphIndexed: true,
     name,
     type: (summary.source_type ?? name.split(".").pop() ?? "doc").toUpperCase(),
     dateAdded: summary.updated_at ? new Date(summary.updated_at).toLocaleDateString() : "Just now",

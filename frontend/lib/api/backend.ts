@@ -68,6 +68,7 @@ export type UploadStatus = {
 
 export type GraphDocumentSummary = {
   source: string;
+  owner_id: string | null;
   name: string | null;
   raw_source: string | null;
   original_file_name: string | null;
@@ -85,6 +86,15 @@ export type RuntimeMetric = { label: string; value: string; detail: string; tone
 export type RuntimeConfig = { key: string; value: string; provider: string };
 export type RuntimeLog = { time: string; level: string; message: string };
 export type RuntimeStatus = { status: string; metrics: RuntimeMetric[]; configs: RuntimeConfig[]; logs: RuntimeLog[] };
+
+export type ChatStreamEvent =
+  | { type: "ready"; run_id: string }
+  | { type: "start"; attempt: string }
+  | { type: "token"; content: string }
+  | { type: "status"; status: string; message: string }
+  | { type: "done"; answer?: string | null }
+  | { type: "error"; message: string }
+  | { type: "heartbeat" };
 
 const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api").replace(/\/$/, "");
 
@@ -169,6 +179,30 @@ export async function getChatRun(runId: string): Promise<ChatRun> {
   return readResponse<ChatRun>(await apiFetch(`/chat/${encodeURIComponent(runId)}`, { cache: "no-store" }));
 }
 
+export async function connectChatRunStream(
+  runId: string,
+  onEvent: (event: ChatStreamEvent) => void,
+  onDisconnect: () => void,
+): Promise<WebSocket> {
+  const token = await authSession.accessToken();
+  const websocketBase = API_BASE_URL.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+  const socket = new WebSocket(`${websocketBase}/chat/${encodeURIComponent(runId)}/stream`);
+  let finished = false;
+  socket.onopen = () => socket.send(JSON.stringify({ type: "authenticate", token }));
+  socket.onmessage = (message) => {
+    const event = JSON.parse(String(message.data)) as ChatStreamEvent;
+    if (event.type === "done" || event.type === "error") finished = true;
+    onEvent(event);
+  };
+  socket.onerror = () => {
+    if (!finished) onDisconnect();
+  };
+  socket.onclose = () => {
+    if (!finished) onDisconnect();
+  };
+  return socket;
+}
+
 export async function listChatSessions(limit = 20): Promise<ChatSession[]> {
   const payload = await readResponse<{ sessions: ChatSession[] }>(await apiFetch(`/chat/sessions?limit=${limit}`, { cache: "no-store" }));
   return payload.sessions;
@@ -184,6 +218,10 @@ export async function getUploadStatus(jobId: string): Promise<UploadStatus> {
   return readResponse<UploadStatus>(await apiFetch(`/documents/upload/${encodeURIComponent(jobId)}`, { cache: "no-store" }));
 }
 
+export async function retryUploadJob(jobId: string): Promise<UploadStatus> {
+  return readResponse<UploadStatus>(await apiFetch(`/documents/upload/${encodeURIComponent(jobId)}/retry`, { method: "POST" }));
+}
+
 export async function listUploadJobs(limit = 20): Promise<UploadStatus[]> {
   const payload = await readResponse<{ jobs: UploadStatus[] }>(await apiFetch(`/documents/uploads?limit=${limit}`, { cache: "no-store" }));
   return payload.jobs;
@@ -194,9 +232,16 @@ export async function listGraphDocuments(limit = 20): Promise<GraphDocumentSumma
   return payload.documents;
 }
 
-export async function getGraphDocument(source: string, limitChunks = 18): Promise<GraphDocument> {
+export async function getGraphDocument(source: string, limitChunks = 18, ownerId?: string | null): Promise<GraphDocument> {
   const params = new URLSearchParams({ source, limit_chunks: String(limitChunks) });
+  if (ownerId) params.set("owner_id", ownerId);
   return readResponse<GraphDocument>(await apiFetch(`/graph/document?${params}`, { cache: "no-store" }));
+}
+
+export async function deleteGraphDocument(source: string, ownerId?: string | null): Promise<void> {
+  const params = new URLSearchParams({ source });
+  if (ownerId) params.set("owner_id", ownerId);
+  await readResponse<{ message: string }>(await apiFetch(`/graph/document?${params}`, { method: "DELETE" }));
 }
 
 export async function getRuntimeStatus(): Promise<RuntimeStatus> {

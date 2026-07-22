@@ -52,7 +52,10 @@ export type EntityNode = {
 
 export type DocumentRow = {
   id: string;
+  jobId?: string;
   source?: string;
+  ownerId?: string | null;
+  graphIndexed?: boolean;
   name: string;
   type: string;
   dateAdded: string;

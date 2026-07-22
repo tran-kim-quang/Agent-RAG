@@ -105,6 +105,7 @@ class UploadJobsResponse(BaseModel):
 
 class GraphDocumentSummary(BaseModel):
     source: str
+    owner_id: str | None = None
     name: str | None = None
     raw_source: str | None = None
     original_file_name: str | None = None

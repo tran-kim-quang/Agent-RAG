@@ -1,6 +1,8 @@
 chunking:
   chunk_size: 1000
   chunk_overlap: 200
+  semantic_window_size: 3000
+  semantic_window_overlap: 200
 
 retriever:
   top_k: 5
