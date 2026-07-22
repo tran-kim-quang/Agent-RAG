@@ -8,6 +8,7 @@ from uuid import uuid4
 
 
 _CURRENT_RUN_ID: ContextVar[str | None] = ContextVar("current_agent_run_id", default=None)
+_CURRENT_EVENT_SINK: ContextVar[object | None] = ContextVar("current_agent_event_sink", default=None)
 
 
 class AgentRunMonitor:
@@ -15,7 +16,7 @@ class AgentRunMonitor:
         self._lock = Lock()
         self._runs: dict[str, dict] = {}
 
-    def create_run(self, run_type: str, input_text: str) -> dict:
+    def create_run(self, run_type: str, input_text: str, user_id: str | None = None) -> dict:
         timestamp = self._now_iso()
         run = {
             "run_id": uuid4().hex,
@@ -23,6 +24,7 @@ class AgentRunMonitor:
             "status": "queued",
             "message": "Queued agent run.",
             "input": input_text,
+            "user_id": user_id,
             "answer": None,
             "error": None,
             "events": [],
@@ -39,6 +41,15 @@ class AgentRunMonitor:
             if run is None:
                 return None
             return self._copy_run(run)
+
+    def list_runs(self, limit: int = 20) -> list[dict]:
+        with self._lock:
+            runs = sorted(
+                self._runs.values(),
+                key=lambda run: run.get("updated_at", ""),
+                reverse=True,
+            )
+            return [self._copy_run(run) for run in runs[:limit]]
 
     def update_run(self, run_id: str, **updates) -> None:
         with self._lock:
@@ -67,13 +78,15 @@ class AgentRunMonitor:
         }
         with self._lock:
             run = self._runs.get(target_run_id)
-            if run is None:
-                return
-            run["events"].append(event)
-            run["message"] = message
-            if status is not None:
-                run["status"] = status
-            run["updated_at"] = event["timestamp"]
+            if run is not None:
+                run["events"].append(event)
+                run["message"] = message
+                if status is not None:
+                    run["status"] = status
+                run["updated_at"] = event["timestamp"]
+        sink = _CURRENT_EVENT_SINK.get()
+        if sink is not None:
+            sink(event, status)
 
     def complete_run(self, run_id: str, answer: str) -> None:
         self.update_run(
@@ -99,6 +112,14 @@ class AgentRunMonitor:
             yield
         finally:
             _CURRENT_RUN_ID.reset(token)
+
+    @contextmanager
+    def bind_event_sink(self, sink):
+        token = _CURRENT_EVENT_SINK.set(sink)
+        try:
+            yield
+        finally:
+            _CURRENT_EVENT_SINK.reset(token)
 
     @staticmethod
     def _copy_run(run: dict) -> dict:

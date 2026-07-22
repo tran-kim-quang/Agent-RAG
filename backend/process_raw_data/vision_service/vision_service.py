@@ -45,7 +45,7 @@ def _post_vision_request(prompt: str, image_b64: str, image_mime_type: str, syst
         f"{base_url}/chat/completions",
         headers=headers,
         json=payload,
-        timeout=120,
+        timeout=max(1, int(os.getenv("VISION_REQUEST_TIMEOUT_SECONDS", "30"))),
     )
     response.raise_for_status()
     data = response.json()

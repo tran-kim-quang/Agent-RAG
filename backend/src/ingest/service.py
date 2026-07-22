@@ -99,7 +99,7 @@ class UploadedFileIngestService:
 
         self._emit_progress(progress_callback, "process", f"Processing raw file {raw_path.name}")
         logger.info("[ingest/process] Processing raw file: raw_path=%s", raw_path)
-        extracted = self._processor.process(raw_path)
+        extracted = self._processor.process(raw_path, progress_callback)
         if extracted is None:
             logger.error("[ingest/process] Unsupported or empty processing result: raw_path=%s", raw_path)
             raise ValueError(f"Could not process uploaded file: {raw_path.name}")
@@ -154,7 +154,7 @@ class UploadedFileIngestService:
             f"Chunking document {markdown_path.name}",
             {"processed_path": str(markdown_path)},
         )
-        chunks = self._chunker.chunk(cleaned_doc)
+        chunks = self._chunker.chunk(cleaned_doc, progress_callback)
         logger.info("[ingest/chunk] Chunking complete: chunk_count=%s", len(chunks))
         self._emit_progress(
             progress_callback,

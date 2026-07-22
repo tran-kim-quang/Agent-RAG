@@ -51,6 +51,7 @@ def test_process_image_file_uses_vision_description(tmp_path, monkeypatch):
 
 
 def test_process_pdf_appends_image_understanding(monkeypatch, tmp_path):
+    monkeypatch.setenv("PDF_MIN_EMBEDDED_IMAGE_BYTES", "0")
     pdf_path = tmp_path / "sample.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
 
@@ -84,6 +85,43 @@ def test_process_pdf_appends_image_understanding(monkeypatch, tmp_path):
     assert "Page two text" in doc["content"]
     assert "VISION:page-1.jpg" in doc["content"]
     assert doc["metadata"]["source_type"] == "pdf"
+
+
+def test_process_pdf_limits_embedded_images_and_reports_page_progress(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "large.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+    fake_pages = [
+        SimpleNamespace(
+            extract_text=lambda number=number: f"Page {number}",
+            images=[SimpleNamespace(name=f"image-{number}.jpg", data=b"large-image")],
+        )
+        for number in range(1, 4)
+    ]
+
+    class FakeReader:
+        def __init__(self, path):
+            self.pages = fake_pages
+
+    described: list[str] = []
+    progress: list[dict] = []
+    monkeypatch.setenv("PDF_MAX_EMBEDDED_IMAGES", "1")
+    monkeypatch.setenv("PDF_MIN_EMBEDDED_IMAGE_BYTES", "0")
+    monkeypatch.setattr(process_service, "_get_pdf_reader_class", lambda: FakeReader)
+    monkeypatch.setattr(
+        process_service,
+        "describe_image_bytes",
+        lambda image_bytes, mime_type=None, image_name=None: described.append(image_name) or "vision",
+    )
+
+    doc = process_service.process_file(
+        pdf_path,
+        lambda phase, message, details: progress.append({"phase": phase, **(details or {})}),
+    )
+
+    assert doc is not None
+    assert described == ["image-1.jpg"]
+    assert [event["current_page"] for event in progress] == [1, 2, 3]
+    assert progress[-1]["progress"] == 34
 
 
 def test_process_pdf_uses_text_layer_directly(monkeypatch, tmp_path):
@@ -153,6 +191,31 @@ def test_process_pdf_uses_ocr_and_correction_for_text_only_page(monkeypatch, tmp
     assert "[Page OCR: 1]" in doc["content"]
     assert "văn bản OCR đã sửa" in doc["content"]
     assert "[Page visual understanding:" not in doc["content"]
+
+
+def test_process_pdf_falls_back_to_ocr_when_vision_is_unavailable(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "vision-unavailable.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    class FakeReader:
+        def __init__(self, path):
+            self.pages = [SimpleNamespace()]
+
+    monkeypatch.setattr(process_service, "_get_pdf_reader_class", lambda: FakeReader)
+    monkeypatch.setattr(process_service, "_extract_pdf_page_text", lambda *args, **kwargs: "")
+    monkeypatch.setattr(process_service, "_render_pdf_page_to_image", lambda *args: ("page.png", b"image"))
+    monkeypatch.setattr(
+        process_service,
+        "_classify_page_image_with_vlm",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("rate limited")),
+    )
+    monkeypatch.setattr(process_service, "_ocr_page_image", lambda *args, **kwargs: "fallback OCR")
+    monkeypatch.setattr(process_service, "_correct_vietnamese_ocr_text", lambda text: text)
+
+    doc = process_service.process_file(pdf_path)
+
+    assert doc is not None
+    assert "fallback OCR" in doc["content"]
 
 
 def test_process_pdf_uses_ocr_and_visual_understanding_for_complex_page(monkeypatch, tmp_path):

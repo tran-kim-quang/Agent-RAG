@@ -11,7 +11,11 @@ ProgressCallback: TypeAlias = Callable[[str, str, ProgressDetails], None]
 
 
 class DocumentProcessor(Protocol):
-    def process(self, file_path: str | Path) -> DocumentRecord | None:
+    def process(
+        self,
+        file_path: str | Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> DocumentRecord | None:
         ...
 
 
@@ -21,7 +25,11 @@ class DocumentCleaner(Protocol):
 
 
 class DocumentChunker(Protocol):
-    def chunk(self, document: DocumentRecord) -> list[ChunkRecord]:
+    def chunk(
+        self,
+        document: DocumentRecord,
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[ChunkRecord]:
         ...
 
 
@@ -40,7 +48,7 @@ class GraphIndexer(Protocol):
 
 
 class GraphSearcher(Protocol):
-    def search(self, query: str) -> list[dict]:
+    def search(self, query: str, owner_id: str | None = None) -> list[dict]:
         ...
 
 

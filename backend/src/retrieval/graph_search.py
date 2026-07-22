@@ -1,49 +1,29 @@
-import os
-from pathlib import Path
+from functools import lru_cache
 from typing import Callable
 
-import yaml
-from dotenv import load_dotenv
 from langchain_community.embeddings import OllamaEmbeddings
-from neo4j import GraphDatabase
 
 from backend.src.monitoring import agent_run_monitor
+from backend.src.security import current_user_id
+from backend.src.infrastructure import create_neo4j_driver, get_ollama_embeddings, load_config
+from backend.src.infrastructure.retrieval_cache import RedisRetrievalCache
+from backend.src.db import Database, SqlKnowledgeBaseRepository
+from backend.src.retrieval.cached_search import CachedGraphSearcher
+from backend.src.retrieval.cached_search import RetrievalOutcome
+from backend.src.retrieval.reranker import get_reranker
 
-load_dotenv()
-
-_CONFIG_PATH = Path(__file__).parents[2] / "configs" / "config.yaml"
-
-with open(_CONFIG_PATH, encoding="utf-8") as handle:
-    _CFG = yaml.safe_load(handle)["retriever"]
+_CFG = load_config()["retriever"]
 
 TOP_K: int = _CFG["top_k"]
 GRAPH_MAX_HOPS: int = _CFG["graph_max_hops"]
 RRF_K: int = _CFG["rrf_k"]
 
 
-def _get_embeddings() -> OllamaEmbeddings:
-    base_url = os.getenv("OLLAMA_LOCAL_URL", "http://localhost:11434/v1").replace("/v1", "")
-    return OllamaEmbeddings(
-        model=os.getenv("EMBEDDING_MODEL_NAME"),
-        base_url=base_url,
-    )
-
-
-def _neo4j_driver():
-    return GraphDatabase.driver(
-        os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-        auth=(
-            os.getenv("NEO4J_USERNAME", "neo4j"),
-            os.getenv("NEO4J_PASSWORD", "password"),
-        ),
-    )
-
-
 class Neo4jGraphSearcher:
     def __init__(
         self,
-        embeddings_factory: Callable[[], OllamaEmbeddings] = _get_embeddings,
-        driver_factory: Callable[[], object] = _neo4j_driver,
+        embeddings_factory: Callable[[], OllamaEmbeddings] = get_ollama_embeddings,
+        driver_factory: Callable[[], object] = create_neo4j_driver,
         top_k: int = TOP_K,
         max_hops: int = GRAPH_MAX_HOPS,
         rrf_k: int = RRF_K,
@@ -54,13 +34,13 @@ class Neo4jGraphSearcher:
         self._max_hops = max_hops
         self._rrf_k = rrf_k
 
-    def search(self, query: str) -> list[dict]:
-        agent_run_monitor.append_event(
-            "embed_query",
-            "Generating the query embedding for semantic retrieval.",
-            status="processing",
-        )
-        query_embedding = self._embeddings_factory().embed_query(query)
+    def search(self, query: str, owner_id: str | None = None, query_embedding: list[float] | None = None) -> list[dict]:
+        owner_id = owner_id or current_user_id()
+        if owner_id is None:
+            return []
+        if query_embedding is None:
+            agent_run_monitor.append_event("embed_query", "Generating the query embedding for semantic retrieval.", status="processing")
+            query_embedding = self._embeddings_factory().embed_query(query)
 
         driver = self._driver_factory()
         with driver.session() as session:
@@ -72,8 +52,9 @@ class Neo4jGraphSearcher:
             )
             seed_result = session.run(
                 """
-                CALL db.index.vector.queryNodes('document_chunks', $top_k, $embedding)
+                CALL db.index.vector.queryNodes('document_chunks', $candidate_k, $embedding)
                 YIELD node AS chunk, score
+                WHERE chunk.owner_id = $owner_id
                 RETURN
                     elementId(chunk)   AS id,
                     chunk.text         AS text,
@@ -81,9 +62,12 @@ class Neo4jGraphSearcher:
                     chunk.chunk_index  AS chunk_index,
                     score
                 ORDER BY score DESC
+                LIMIT $top_k
                 """,
                 top_k=self._top_k,
+                candidate_k=max(self._top_k * 10, 100),
                 embedding=query_embedding,
+                owner_id=owner_id,
             )
             seeds = [dict(record) for record in seed_result]
 
@@ -94,6 +78,7 @@ class Neo4jGraphSearcher:
                     {"seed_count": 0},
                     status="processing",
                 )
+                driver.close()
                 return []
 
             seed_ids = [seed["id"] for seed in seeds]
@@ -109,6 +94,7 @@ class Neo4jGraphSearcher:
                 MATCH (seed)
                 WHERE elementId(seed) = seedId
                 MATCH path = (seed)-[:NEXT_CHUNK*1..{self._max_hops}]-(neighbour:Chunk)
+                WHERE neighbour.owner_id = $owner_id
                 RETURN DISTINCT
                     elementId(neighbour) AS id,
                     neighbour.text        AS text,
@@ -116,6 +102,7 @@ class Neo4jGraphSearcher:
                     neighbour.chunk_index AS chunk_index
                 """,
                 seed_ids=seed_ids,
+                owner_id=owner_id,
             )
             neighbours = [dict(record) for record in neighbour_result]
 
@@ -163,4 +150,25 @@ def graph_search(query: str) -> list[dict]:
     3. Re-rank with Reciprocal Rank Fusion (RRF_K smoothing).
     4. Return deduplicated chunks ordered by RRF score.
     """
-    return Neo4jGraphSearcher().search(query)
+    owner_id = current_user_id()
+    if owner_id is None:
+        return []
+    return _cached_searcher().search(query, owner_id)
+
+
+def graph_search_with_artifact(query: str) -> RetrievalOutcome | None:
+    owner_id = current_user_id()
+    if owner_id is None:
+        return None
+    return _cached_searcher().search_with_artifact(query, owner_id)
+
+
+@lru_cache(maxsize=1)
+def _cached_searcher() -> CachedGraphSearcher:
+    return CachedGraphSearcher(
+        searcher=Neo4jGraphSearcher(),
+        cache=RedisRetrievalCache(),
+        knowledge_bases=SqlKnowledgeBaseRepository(Database()),
+        embeddings_factory=get_ollama_embeddings,
+        reranker=get_reranker(),
+    )
